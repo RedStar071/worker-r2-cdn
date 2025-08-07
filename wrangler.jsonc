@@ -8,7 +8,7 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2025-08-06",
 	"observability": {
-		"enabled": true
+		"enabled": true,
 	},
 	/**
 	 * Smart Placement
@@ -40,7 +40,5 @@
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
 	 */
 	// "services": [{ "binding": "MY_SERVICE", "service": "my-service" }],
-	"kv_namespaces": [
-		{ "binding": "IMAGE_CACHE", "id": "671f7f35b0ca475aa1924e8ff7506f75" }
-	]
+	"kv_namespaces": [{ "binding": "IMAGE_CACHE", "id": "671f7f35b0ca475aa1924e8ff7506f75" }],
 }
