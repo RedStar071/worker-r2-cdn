@@ -37,16 +37,21 @@ export default {
 
 		// Implementa la logica di caching con KV
 		const cacheKey = url.toString();
-		const cachedData = await env.IMAGE_CACHE.get(cacheKey, { type: 'json' });
+		const cachedData = await env.IMAGE_CACHE.get(cacheKey, { type: 'json' }) as {
+			status: number;
+			statusText: string;
+			headers: Record<string, string>;
+			body: string;
+		} ?? null;
 
-		if (cachedData) {
+		if (cachedData && "status" in cachedData && "statusText" in cachedData && "headers" in cachedData && "body" in cachedData) {
 			console.log(`Cache HIT for: ${cacheKey}`);
-			// @ts-ignore
+
 			const body = Uint8Array.from(atob(cachedData.body), c => c.charCodeAt(0));
-			// @ts-ignore
+
 			const headers = new Headers(cachedData.headers);
 			headers.set('X-Cache-Status', 'HIT');
-			// @ts-ignore
+
 			return new Response(body, { status: cachedData.status, statusText: cachedData.statusText, headers });
 		}
 		console.log(`Cache MISS for: ${cacheKey}`);
@@ -69,6 +74,33 @@ export default {
     }
 
     try {
+			// Lista di estensioni di immagine supportate
+			const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'tiff', 'avif'];
+			const fileExtension = pathname.split('.').pop()?.toLowerCase();
+
+			// Se non è un'immagine, restituisci il file originale senza trasformazioni
+			if (!fileExtension || !imageExtensions.includes(fileExtension)) {
+				const r2Url = `${env.R2_PUBLIC_URL}/${pathname.slice(1)}`;
+				const r2Response = await fetch(r2Url);
+
+				if (!r2Response.ok) {
+					return new Response('File not found', { status: 404, headers: corsHeaders });
+				}
+
+				const fileResponse = new Response(r2Response.body, {
+					headers: {
+						...corsHeaders,
+						'Content-Type': r2Response.headers.get('Content-Type') || 'application/octet-stream',
+						'Cache-Control': 'public, max-age=86400',
+						'X-Cache-Status': 'MISS'
+					}
+				});
+
+				const kvObject = await responseToKvObject(fileResponse.clone());
+				ctx.waitUntil(env.IMAGE_CACHE.put(cacheKey, JSON.stringify(kvObject), { expirationTtl: 86400 })); // Cache per 1 giorno
+				return fileResponse;
+			}
+
       // Estrai parametri di trasformazione
       const width = searchParams.get('w')
       const height = searchParams.get('h')
@@ -178,7 +210,7 @@ export default {
       }
 
       // Determina il Content-Type corretto
-      let contentType = transformedResponse.headers.get('Content-Type')
+      let contentType = transformedResponse.headers.get('Content-Type') ?? 'image/jpeg';
       if (imageTransformOptions.format && contentType && !contentType.includes(imageTransformOptions.format)) {
         contentType = `image/${imageTransformOptions.format}`
       }
@@ -186,7 +218,7 @@ export default {
       const finalResponse = new Response(transformedResponse.body, {
         headers: {
           ...corsHeaders,
-          'Content-Type': contentType!,
+          'Content-Type': contentType,
           'Cache-Control': 'public, max-age=31536000, immutable',
           'Vary': 'Accept',
           'X-Transform-Status': 'success',
