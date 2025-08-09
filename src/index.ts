@@ -10,10 +10,30 @@
  *
  * Learn more at https://developers.cloudflare.com/workers/
  */
+/**
+ * Welcome to Cloudflare Workers!
+ *
+ * This worker acts as an intelligent image resizing proxy.
+ * It fetches original images from an R2 bucket, applies transformations
+ * using Cloudflare Image Resizing based on URL query parameters,
+ * and caches the results efficiently using the Cache API.
+ */
 
+// --- Type Definitions for Clarity and Type Safety ---
+
+/**
+ * Cloudflare Image Resizing options for the 'fit' parameter.
+ */
 type CfImageFit = 'scale-down' | 'contain' | 'cover' | 'crop' | 'pad';
-type CfImageFormat = 'webp' | 'avif' | 'jpeg' | 'png';
 
+/**
+ * Supported output image formats.
+ */
+type CfImageFormat = 'webp' | 'avif' | 'jpeg' | 'png' | 'json';
+
+/**
+ * Interface for the object passed to the `cf.image` property for transformations.
+ */
 interface CfImageTransformOptions {
 	width?: number;
 	height?: number;
@@ -22,228 +42,231 @@ interface CfImageTransformOptions {
 	format?: CfImageFormat;
 }
 
-// worker.js
+/**
+ * Defines the environment variables expected by the worker.
+ * Regenerate with `npm run cf-typegen` after updating wrangler.jsonc.
+ */
+interface Env {
+	R2_PUBLIC_URL: string;
+	ALLOWED_ORIGINS: string;
+	// The Cache API is used instead of a KV namespace for responses.
+}
+
+// --- Constants for Configuration and Maintainability ---
+
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'tiff', 'avif']);
+const CORS_MAX_AGE = '86400'; // 24 hours
+const IMMUTABLE_CACHE_TTL = 31536000; // 1 year
+const DEFAULT_CACHE_TTL = 86400; // 1 day
+
+// --- Main Worker Handler ---
+
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-		const url = new URL(request.url);
-
-		// Implementa la logica di caching con KV
-		const cacheKey = url.toString();
-		const cachedData =
-			((await env.IMAGE_CACHE.get(cacheKey, { type: 'json' })) as {
-				status: number;
-				statusText: string;
-				headers: Record<string, string>;
-				body: string;
-			}) ?? null;
-
-		if (cachedData && 'status' in cachedData && 'statusText' in cachedData && 'headers' in cachedData && 'body' in cachedData) {
-			console.log(`Cache HIT for: ${cacheKey}`);
-
-			const body = Uint8Array.from(atob(cachedData.body), (c) => c.charCodeAt(0));
-
-			const headers = new Headers(cachedData.headers);
-			headers.set('X-Cache-Status', 'HIT');
-
-			return new Response(body, { status: cachedData.status, statusText: cachedData.statusText, headers });
-		}
-		console.log(`Cache MISS for: ${cacheKey}`);
-
-		const { searchParams, pathname } = url;
-
-		// Headers CORS
-		const corsHeaders = {
-			'Access-Control-Allow-Origin': env.ALLOWED_ORIGINS || '*',
-			'Access-Control-Allow-Methods': 'GET, OPTIONS',
-			'Access-Control-Allow-Headers': 'Content-Type',
-			'Access-Control-Max-Age': '86400',
-		};
-
-		// Gestisci richieste OPTIONS per CORS
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		// Handle CORS preflight requests first
 		if (request.method === 'OPTIONS') {
-			return new Response(null, {
-				headers: corsHeaders,
-			});
+			return handleCorsPreflight(env);
 		}
+
+		const cache = caches.default;
+		const cachedResponse = await cache.match(request);
+
+		if (cachedResponse) {
+			console.log(`Cache HIT for: ${request.url}`);
+			// Return a new response to add our custom cache header
+			const response = new Response(cachedResponse.body, cachedResponse);
+			response.headers.set('X-Cache-Status', 'HIT');
+			return response;
+		}
+
+		console.log(`Cache MISS for: ${request.url}`);
 
 		try {
-			// Lista di estensioni di immagine supportate
-			const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'tiff', 'avif'];
-			const fileExtension = pathname.split('.').pop()?.toLowerCase();
+			const response = await handleRequest(request, env);
 
-			// Se non è un'immagine, restituisci il file originale senza trasformazioni
-			if (!fileExtension || !imageExtensions.includes(fileExtension)) {
-				const r2Url = `${env.R2_PUBLIC_URL}/${pathname.slice(1)}`;
-				const r2Response = await fetch(r2Url);
+			// Add cache miss header before caching and returning
+			response.headers.set('X-Cache-Status', 'MISS');
 
-				if (!r2Response.ok) {
-					return new Response('File not found', { status: 404, headers: corsHeaders });
-				}
+			// Asynchronously cache the successful response
+			ctx.waitUntil(cache.put(request, response.clone()));
 
-				const fileResponse = new Response(r2Response.body, {
-					headers: {
-						...corsHeaders,
-						'Content-Type': r2Response.headers.get('Content-Type') || 'application/octet-stream',
-						'Cache-Control': 'public, max-age=86400',
-						'X-Cache-Status': 'MISS',
-					},
-				});
-
-				const kvObject = await responseToKvObject(fileResponse.clone());
-				ctx.waitUntil(env.IMAGE_CACHE.put(cacheKey, JSON.stringify(kvObject), { expirationTtl: 86400 })); // Cache per 1 giorno
-				return fileResponse;
-			}
-
-			// Estrai parametri di trasformazione
-			const width = searchParams.get('w');
-			const height = searchParams.get('h');
-			const quality = searchParams.get('q') || '85';
-			const fit = searchParams.get('fit') || 'cover';
-			const format = searchParams.get('f');
-
-			// Costruisci URL completo per R2
-			const r2BaseUrl = env.R2_PUBLIC_URL;
-			if (!r2BaseUrl) {
-				throw new Error('R2_PUBLIC_URL environment variable is required');
-			}
-
-			// Rimuovi il leading slash se presente
-			const cleanPathname = pathname.startsWith('/') ? pathname.slice(1) : pathname;
-			const r2Url = `${r2BaseUrl}/${cleanPathname}`;
-
-			console.log(`Fetching image from R2: ${r2Url}`);
-
-			// Fetch dall'R2 bucket
-			let r2Response = await fetch(r2Url, {
-				headers: {
-					'User-Agent': 'Cloudflare-Worker-Image-Resizer/1.0',
-				},
-			});
-
-			if (!r2Response.ok) {
-				console.error(`R2 fetch failed: ${r2Response.status} ${r2Response.statusText}`);
-				return new Response(`Image not found: ${cleanPathname}`, {
-					status: 404,
-					headers: corsHeaders,
-				});
-			}
-
-			// Se non ci sono parametri di trasformazione, restituisci l'immagine originale
-			if (!width && !height && !format) {
-				const imageResponse = new Response(r2Response.body, {
-					headers: {
-						...corsHeaders,
-						'Content-Type': r2Response.headers.get('Content-Type') || 'image/jpeg',
-						'Cache-Control': 'public, max-age=31536000, immutable',
-						Vary: 'Accept',
-						'X-Cache-Status': 'MISS',
-					},
-				});
-				const kvObject = await responseToKvObject(imageResponse.clone());
-				ctx.waitUntil(env.IMAGE_CACHE.put(cacheKey, JSON.stringify(kvObject), { expirationTtl: 31536000 }));
-				return imageResponse;
-			}
-
-			// Applica trasformazioni usando Cloudflare Image Resizing
-			const imageTransformOptions: CfImageTransformOptions = {};
-
-			if (width) {
-				imageTransformOptions.width = parseInt(width, 10);
-			}
-
-			if (height) {
-				imageTransformOptions.height = parseInt(height, 10);
-			}
-
-			if (quality) {
-				const qualityNum = parseInt(quality, 10);
-				if (qualityNum >= 1 && qualityNum <= 100) {
-					imageTransformOptions.quality = qualityNum;
-				}
-			}
-
-			if (fit) {
-				// Cloudflare supporta: scale-down, contain, cover, crop, pad
-				const validFits: CfImageFit[] = ['scale-down', 'contain', 'cover', 'crop', 'pad'];
-				if (validFits.includes(fit as CfImageFit)) {
-					imageTransformOptions.fit = fit as CfImageFit;
-				}
-			}
-
-			if (format) {
-				// Cloudflare supporta: webp, avif, jpeg, png
-				const validFormats: CfImageFormat[] = ['webp', 'avif', 'jpeg', 'png'];
-				const lowerCaseFormat = format.toLowerCase() as CfImageFormat;
-				if (validFormats.includes(lowerCaseFormat)) {
-					imageTransformOptions.format = lowerCaseFormat;
-				}
-			}
-
-			console.log('Transform options:', JSON.stringify(imageTransformOptions));
-
-			// Applica le trasformazioni
-			const transformedResponse = await fetch(r2Url, { cf: { image: imageTransformOptions } });
-
-			if (!transformedResponse.ok) {
-				console.error(`Image transformation failed: ${transformedResponse.status}`);
-				// Fallback all'immagine originale
-				r2Response = await fetch(r2Url);
-				const fallbackResponse = new Response(r2Response.body, {
-					headers: {
-						...corsHeaders,
-						'Content-Type': r2Response.headers.get('Content-Type') || 'image/jpeg',
-						'Cache-Control': 'public, max-age=31536000',
-						'X-Transform-Status': 'fallback-original',
-						'X-Cache-Status': 'MISS',
-					},
-				});
-				const kvObject = await responseToKvObject(fallbackResponse.clone());
-				ctx.waitUntil(env.IMAGE_CACHE.put(cacheKey, JSON.stringify(kvObject), { expirationTtl: 31536000 }));
-				return fallbackResponse;
-			}
-
-			// Determina il Content-Type corretto
-			let contentType = transformedResponse.headers.get('Content-Type') ?? 'image/jpeg';
-			if (imageTransformOptions.format && contentType && !contentType.includes(imageTransformOptions.format)) {
-				contentType = `image/${imageTransformOptions.format}`;
-			}
-
-			const finalResponse = new Response(transformedResponse.body, {
-				headers: {
-					...corsHeaders,
-					'Content-Type': contentType,
-					'Cache-Control': 'public, max-age=31536000, immutable',
-					Vary: 'Accept',
-					'X-Transform-Status': 'success',
-					'X-Cache-Status': 'MISS',
-				},
-			});
-			const kvObject = await responseToKvObject(finalResponse.clone());
-			ctx.waitUntil(env.IMAGE_CACHE.put(cacheKey, JSON.stringify(kvObject), { expirationTtl: 31536000 }));
-			return finalResponse;
+			return response;
 		} catch (error) {
 			console.error('Worker error:', error);
-			if (error instanceof Error) {
-				return new Response(`Internal server error: ${error.message}`, {
-					status: 500,
-					headers: corsHeaders,
-				});
-			}
-			return new Response('Internal server error', {
+			const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
+			return new Response(`Internal Server Error: ${errorMessage}`, {
 				status: 500,
-				headers: corsHeaders,
+				headers: getCorsHeaders(env),
 			});
 		}
 	},
 };
+
+// --- Helper Functions for Modularity and Readability ---
+
+/**
+ * Handles the main request logic after a cache miss.
+ */
+async function handleRequest(request: Request, env: Env): Promise<Response> {
+	const url = new URL(request.url);
+	const { pathname, searchParams } = url;
+
+	if (!env.R2_PUBLIC_URL) {
+		throw new Error('R2_PUBLIC_URL environment variable is not configured.');
+	}
+
+	const fileExtension = pathname.split('.').pop()?.toLowerCase() ?? '';
+	const isImage = IMAGE_EXTENSIONS.has(fileExtension);
+
+	if (!isImage) {
+		return serveStaticFile(pathname, env);
+	}
+
+	const transformOptions = parseTransformations(searchParams);
+	const hasTransformations = Object.keys(transformOptions).length > 0;
+
+	if (!hasTransformations) {
+		return serveOriginalImage(pathname, env);
+	}
+
+	return serveTransformedImage(pathname, transformOptions, env);
+}
+
+/**
+ * Parses and validates image transformation parameters from the URL.
+ */
+function parseTransformations(searchParams: URLSearchParams): CfImageTransformOptions {
+	const options: CfImageTransformOptions = {};
+
+	const width = parseInt(searchParams.get('w') || '', 10);
+	if (!isNaN(width) && width > 0) options.width = width;
+
+	const height = parseInt(searchParams.get('h') || '', 10);
+	if (!isNaN(height) && height > 0) options.height = height;
+
+	const quality = parseInt(searchParams.get('q') || '85', 10);
+	if (!isNaN(quality) && quality > 0 && quality <= 100) options.quality = quality;
+
+	const fit = searchParams.get('fit') as CfImageFit;
+	if (['scale-down', 'contain', 'cover', 'crop', 'pad'].includes(fit)) options.fit = fit;
+
+	const format = searchParams.get('f')?.toLowerCase() as CfImageFormat;
+	if (['webp', 'avif', 'jpeg', 'png', 'json'].includes(format)) options.format = format;
+
+	return options;
+}
+
+/**
+ * Fetches and serves a non-image file directly from R2.
+ */
+async function serveStaticFile(pathname: string, env: Env): Promise<Response> {
+	const r2Url = getR2Url(pathname, env);
+	const r2Response = await fetch(r2Url);
+
+	if (!r2Response.ok) {
+		return new Response('File not found', { status: 404, headers: getCorsHeaders(env) });
+	}
+
+	const headers = new Headers(r2Response.headers);
+	headers.set('Cache-Control', `public, max-age=${DEFAULT_CACHE_TTL}`);
+	appendCorsHeaders(headers, env);
+
+	return new Response(r2Response.body, { headers });
+}
+
+/**
+ * Serves the original image without any transformations.
+ */
+async function serveOriginalImage(pathname: string, env: Env): Promise<Response> {
+	return fetchFromR2(pathname, {}, env);
+}
+
+/**
+ * Serves a transformed image using Cloudflare Image Resizing.
+ * Includes fallback to the original image if transformation fails.
+ */
+async function serveTransformedImage(pathname: string, options: CfImageTransformOptions, env: Env): Promise<Response> {
+	console.log('Applying transform options:', JSON.stringify(options));
+
+	const transformedResponse = await fetchFromR2(pathname, options, env);
+
+	if (transformedResponse.ok) {
+		transformedResponse.headers.set('X-Transform-Status', 'success');
+		return transformedResponse;
+	}
+
+	// Fallback: If transformation fails, serve the original image.
+	console.warn(`Image transformation failed with status ${transformedResponse.status}. Falling back to original.`);
+	const fallbackResponse = await fetchFromR2(pathname, {}, env);
+	fallbackResponse.headers.set('X-Transform-Status', 'fallback-original');
+	return fallbackResponse;
+}
+
+/**
+ * Generic function to fetch an image from R2, optionally applying transformations.
+ */
+async function fetchFromR2(pathname: string, cfOptions: CfImageTransformOptions, env: Env): Promise<Response> {
+	const r2Url = getR2Url(pathname, env);
+	const r2Response = await fetch(r2Url, { cf: { image: cfOptions } });
+
+	if (!r2Response.ok) {
+		// Return the failing response so the caller can decide on a fallback
+		return r2Response;
+	}
+
+	const headers = new Headers(r2Response.headers);
+	headers.set('Cache-Control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
+	headers.set('Vary', 'Accept'); // Important for content negotiation
+	appendCorsHeaders(headers, env);
+
+	return new Response(r2Response.body, {
+		status: r2Response.status,
+		statusText: r2Response.statusText,
+		headers,
+	});
+}
+
+/**
+ * Constructs the full public URL for an R2 object.
+ */
+function getR2Url(pathname: string, env: Env): string {
+	// R2 public URL doesn't need a leading slash on the object key
+	const objectKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
+	return `${env.R2_PUBLIC_URL}/${objectKey}`;
+}
+
+/**
+ * Returns a response for CORS preflight (OPTIONS) requests.
+ */
+function handleCorsPreflight(env: Env): Response {
+	return new Response(null, {
+		status: 204, // No Content
+		headers: getCorsHeaders(env),
+	});
+}
+
+/**
+ * Returns an object with the appropriate CORS headers.
+ */
+function getCorsHeaders(env: Env): Record<string, string> {
+	return {
+		'Access-Control-Allow-Origin': env.ALLOWED_ORIGINS || '*',
+		'Access-Control-Allow-Methods': 'GET, OPTIONS',
+		'Access-Control-Allow-Headers': 'Content-Type',
+		'Access-Control-Max-Age': CORS_MAX_AGE,
+	};
+}
+
+/**
+ * Appends CORS headers to an existing Headers object.
+ */
+function appendCorsHeaders(headers: Headers, env: Env): void {
+	const cors = getCorsHeaders(env);
+	for (const key in cors) {
+		headers.set(key, cors[key]);
+	}
+}
+
 
 async function responseToKvObject(response: Response) {
 	const body = await response.arrayBuffer();
