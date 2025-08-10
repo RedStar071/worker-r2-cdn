@@ -73,30 +73,20 @@ export default {
 
 		if (cachedResponse) {
 			console.log(`Cache HIT for: ${request.url}`);
-			// Create new headers from the cached response to make them mutable
-			const headers = new Headers(cachedResponse.headers);
-			headers.set('X-Cache-Status', 'HIT');
-
-			// Return a new response with the cached body and new headers
-			return new Response(cachedResponse.body, {
-				status: cachedResponse.status,
-				statusText: cachedResponse.statusText,
-				headers,
-			});
+			// Return a new response with our custom cache header
+			return createResponseWithHeaders(cachedResponse, { 'X-Cache-Status': 'HIT' });
 		}
 
 		console.log(`Cache MISS for: ${request.url}`);
 
 		try {
-			const response = await handleRequest(request, env);
-
-			// Create a new response to add the cache-status header
-			const finalResponse = createResponseWithHeaders(response, { 'X-Cache-Status': 'MISS' });
+			const originalResponse = await handleRequest(request, env);
+			const response = createResponseWithHeaders(originalResponse, { 'X-Cache-Status': 'MISS' });
 
 			// Asynchronously cache the successful response
-			ctx.waitUntil(cache.put(request, finalResponse.clone()));
+			ctx.waitUntil(cache.put(request, response.clone()));
 
-			return finalResponse;
+			return response;
 		} catch (error) {
 			console.error('Worker error:', error);
 			const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
@@ -197,25 +187,13 @@ async function serveTransformedImage(pathname: string, options: CfImageTransform
 	const transformedResponse = await fetchFromR2(pathname, options, env);
 
 	if (transformedResponse.ok) {
-		const headers = new Headers(transformedResponse.headers);
-		headers.set('X-Transform-Status', 'success');
-		return new Response(transformedResponse.body, {
-			status: transformedResponse.status,
-			statusText: transformedResponse.statusText,
-			headers,
-		});
+		return createResponseWithHeaders(transformedResponse, { 'X-Transform-Status': 'success' });
 	}
 
 	// Fallback: If transformation fails, serve the original image.
 	console.warn(`Image transformation failed with status ${transformedResponse.status}. Falling back to original.`);
 	const fallbackResponse = await fetchFromR2(pathname, {}, env);
-	const headers = new Headers(fallbackResponse.headers);
-	headers.set('X-Transform-Status', 'fallback-original');
-	return new Response(fallbackResponse.body, {
-		status: fallbackResponse.status,
-		statusText: fallbackResponse.statusText,
-		headers,
-	});
+	return createResponseWithHeaders(fallbackResponse, { 'X-Transform-Status': 'fallback-original' });
 }
 
 /**
@@ -283,6 +261,24 @@ function appendCorsHeaders(headers: Headers, env: Env): void {
 	}
 }
 
+/**
+ * Creates a new Response with additional or overwritten headers.
+ * @param response The original response.
+ * @param newHeaders An object of headers to add or overwrite.
+ * @returns A new Response object with the modified headers.
+ */
+function createResponseWithHeaders(response: Response, newHeaders: Record<string, string>): Response {
+	const headers = new Headers(response.headers);
+	for (const [key, value] of Object.entries(newHeaders)) {
+		headers.set(key, value);
+	}
+
+	return new Response(response.body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers,
+	});
+}
 
 async function responseToKvObject(response: Response) {
 	const body = await response.arrayBuffer();
