@@ -46,11 +46,6 @@ interface CfImageTransformOptions {
  * Defines the environment variables expected by the worker.
  * Regenerate with `npm run cf-typegen` after updating wrangler.jsonc.
  */
-interface Env {
-	R2_PUBLIC_URL: string;
-	ALLOWED_ORIGINS: string;
-	// The Cache API is used instead of a KV namespace for responses.
-}
 
 // --- Constants for Configuration and Maintainability ---
 
@@ -62,7 +57,7 @@ const DEFAULT_CACHE_TTL = 86400; // 1 day
 // --- Main Worker Handler ---
 
 export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	async fetch(request, env, ctx): Promise<Response> {
 		// Handle CORS preflight requests first
 		if (request.method === 'OPTIONS') {
 			return handleCorsPreflight(env);
@@ -96,7 +91,7 @@ export default {
 			});
 		}
 	},
-};
+} satisfies ExportedHandler;
 
 // --- Helper Functions for Modularity and Readability ---
 
