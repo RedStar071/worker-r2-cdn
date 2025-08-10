@@ -91,13 +91,7 @@ export default {
 			const response = await handleRequest(request, env);
 
 			// Create a new response to add the cache-status header
-			const headers = new Headers(response.headers);
-			headers.set('X-Cache-Status', 'MISS');
-			const finalResponse = new Response(response.body, {
-				status: response.status,
-				statusText: response.statusText,
-				headers,
-			});
+			const finalResponse = createResponseWithHeaders(response, { 'X-Cache-Status': 'MISS' });
 
 			// Asynchronously cache the successful response
 			ctx.waitUntil(cache.put(request, finalResponse.clone()));
