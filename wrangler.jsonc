@@ -27,7 +27,7 @@
 	 */
 	"vars": {
 		"R2_PUBLIC_URL": "https://9594839a2728caa012af14c0b7ef8c79.r2.cloudflarestorage.com/wolfstar",
-		"ALLOWED_ORIGINS": "https://www.wolfstar.rocks,https:/wolfstar.rocks",
+		"ALLOWED_ORIGINS": "https://www.wolfstar.rocks,https://wolfstar.rocks",
 		"R2_WORKER_URL": "worker-r2-cdn.redstar071.workers.dev"
 	},
 	/**
