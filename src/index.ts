@@ -186,7 +186,8 @@ async function serveStaticFile(pathname: string, env: Env): Promise<Response> {
 	const object = await env.wolfstar_cdn.get(objectKey);
 
 	if (object === null) {
-		return new Response('Object Not Found', { status: 404 });
+		console.error(`Object not found in R2 bucket. Key: ${objectKey}`);
+		return new Response(`Object Not Found: ${objectKey}`, { status: 404 });
 	}
 
 	const headers = new Headers();
@@ -236,7 +237,8 @@ async function fetchFromR2(pathname: string, cfOptions: CfImageTransformOptions,
 	// First, check if the object exists using the R2 binding for efficiency.
 	const head = await env.wolfstar_cdn.head(objectKey);
 	if (head === null) {
-		return new Response('Object Not Found', { status: 404 });
+		console.error(`Object head not found in R2 bucket. Key: ${objectKey}`);
+		return new Response(`Object Not Found: ${objectKey}`, { status: 404 });
 	}
 
 	// If the object exists, use the public URL with fetch to apply transformations.
