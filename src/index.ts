@@ -51,14 +51,20 @@ interface CfImageTransformOptions {
 // --- Constants for Configuration and Maintainability ---
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'tiff', 'avif']);
+const ALLOWED_FIT_MODES = new Set<CfImageFit>(['scale-down', 'contain', 'cover', 'crop', 'pad']);
+const ALLOWED_FORMATS = new Set<CfImageFormat>(['webp', 'avif', 'jpeg', 'png', 'json']);
 const CORS_MAX_AGE = '86400'; // 24 hours
 const IMMUTABLE_CACHE_TTL = 31536000; // 1 year
 const DEFAULT_CACHE_TTL = 86400; // 1 day
 
+const DEFAULT_TRANSFORM_OPTIONS: Readonly<Partial<CfImageTransformOptions>> = {
+	quality: 85
+};
+
 // --- Main Worker Handler ---
 
 export default {
-	async fetch(request, env, ctx): Promise<Response> {
+	async fetch(request, env, _ctx): Promise<Response> {
 		// Handle CORS preflight requests first
 		if (request.method === 'OPTIONS') {
 			return handleCorsPreflight(env);
@@ -128,22 +134,46 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
  * Parses and validates image transformation parameters from the URL.
  */
 function parseTransformations(searchParams: URLSearchParams): CfImageTransformOptions {
-	const options: CfImageTransformOptions = {};
+	const hasTransformationParams = ['w', 'h', 'q', 'fit', 'f'].some((p) => searchParams.has(p));
+	if (!hasTransformationParams) {
+		return {};
+	}
 
-	const width = parseInt(searchParams.get('w') || '', 10);
-	if (!isNaN(width) && width > 0) options.width = width;
+	const options: CfImageTransformOptions = { ...DEFAULT_TRANSFORM_OPTIONS };
 
-	const height = parseInt(searchParams.get('h') || '', 10);
-	if (!isNaN(height) && height > 0) options.height = height;
+	const widthParam = searchParams.get('w');
+	if (widthParam) {
+		const width = parseInt(widthParam, 10);
+		if (!isNaN(width) && width > 0) {
+			options.width = width;
+		}
+	}
 
-	const quality = parseInt(searchParams.get('q') || '85', 10);
-	if (!isNaN(quality) && quality > 0 && quality <= 100) options.quality = quality;
+	const heightParam = searchParams.get('h');
+	if (heightParam) {
+		const height = parseInt(heightParam, 10);
+		if (!isNaN(height) && height > 0) {
+			options.height = height;
+		}
+	}
 
-	const fit = searchParams.get('fit') as CfImageFit;
-	if (['scale-down', 'contain', 'cover', 'crop', 'pad'].includes(fit)) options.fit = fit;
+	const qualityParam = searchParams.get('q');
+	if (qualityParam) {
+		const quality = parseInt(qualityParam, 10);
+		if (!isNaN(quality) && quality > 0 && quality <= 100) {
+			options.quality = quality;
+		}
+	}
 
-	const format = searchParams.get('f')?.toLowerCase() as CfImageFormat;
-	if (['webp', 'avif', 'jpeg', 'png', 'json'].includes(format)) options.format = format;
+	const fitParam = searchParams.get('fit') as CfImageFit;
+	if (fitParam && ALLOWED_FIT_MODES.has(fitParam)) {
+		options.fit = fitParam;
+	}
+
+	const formatParam = searchParams.get('f')?.toLowerCase() as CfImageFormat;
+	if (formatParam && ALLOWED_FORMATS.has(formatParam)) {
+		options.format = formatParam;
+	}
 
 	return options;
 }
@@ -152,18 +182,23 @@ function parseTransformations(searchParams: URLSearchParams): CfImageTransformOp
  * Fetches and serves a non-image file directly from R2.
  */
 async function serveStaticFile(pathname: string, env: Env): Promise<Response> {
-	const r2Url = getR2Url(pathname, env);
-	const r2Response = await fetch(r2Url);
+	const objectKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
+	const object = await env.wolfstar_cdn.get(objectKey);
 
-	if (!r2Response.ok) {
-		return new Response('File not found', { status: 404, headers: getCorsHeaders(env) });
+	if (object === null) {
+		return new Response('Object Not Found', { status: 404 });
 	}
 
-	const headers = new Headers(r2Response.headers);
-	headers.set('Cache-Control', `public, max-age=${DEFAULT_CACHE_TTL}`);
+	const headers = new Headers();
+	object.writeHttpMetadata(headers);
+	headers.set('etag', object.httpEtag);
+	headers.set('Cache-Control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
+	headers.set('Vary', 'Accept'); // Important for content negotiation
 	appendCorsHeaders(headers, env);
 
-	return new Response(r2Response.body, { headers });
+	return new Response(object.body, {
+		headers,
+	});
 }
 
 /**
@@ -196,17 +231,28 @@ async function serveTransformedImage(pathname: string, options: CfImageTransform
  * Generic function to fetch an image from R2, optionally applying transformations.
  */
 async function fetchFromR2(pathname: string, cfOptions: CfImageTransformOptions, env: Env): Promise<Response> {
+	const objectKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
+
+	// First, check if the object exists using the R2 binding for efficiency.
+	const head = await env.wolfstar_cdn.head(objectKey);
+	if (head === null) {
+		return new Response('Object Not Found', { status: 404 });
+	}
+
+	// If the object exists, use the public URL with fetch to apply transformations.
 	const r2Url = getR2Url(pathname, env);
 	const r2Response = await fetch(r2Url, { cf: { image: cfOptions } });
 
 	if (!r2Response.ok) {
-		// Return the failing response so the caller can decide on a fallback
+		// This might still happen for other reasons (e.g., permissions), but we've already handled 404s.
 		return r2Response;
 	}
 
 	const headers = new Headers(r2Response.headers);
 	headers.set('Cache-Control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
 	headers.set('Vary', 'Accept'); // Important for content negotiation
+	head.writeHttpMetadata(headers);
+	headers.set("etag", head.httpEtag);
 	appendCorsHeaders(headers, env);
 
 	return new Response(r2Response.body, {
@@ -276,16 +322,4 @@ function createResponseWithHeaders(response: Response, newHeaders: Record<string
 	});
 }
 
-async function responseToKvObject(response: Response) {
-	const body = await response.arrayBuffer();
-	const headers: Record<string, string> = {};
-	response.headers.forEach((value, key) => {
-		headers[key] = value;
-	});
-	return {
-		body: btoa(String.fromCharCode(...new Uint8Array(body))),
-		headers,
-		status: response.status,
-		statusText: response.statusText,
-	};
-}
+
