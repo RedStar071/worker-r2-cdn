@@ -73,10 +73,16 @@ export default {
 
 		if (cachedResponse) {
 			console.log(`Cache HIT for: ${request.url}`);
-			// Return a new response to add our custom cache header
-			const response = new Response(cachedResponse.body, cachedResponse);
-			response.headers.set('X-Cache-Status', 'HIT');
-			return response;
+			// Create new headers from the cached response to make them mutable
+			const headers = new Headers(cachedResponse.headers);
+			headers.set('X-Cache-Status', 'HIT');
+
+			// Return a new response with the cached body and new headers
+			return new Response(cachedResponse.body, {
+				status: cachedResponse.status,
+				statusText: cachedResponse.statusText,
+				headers,
+			});
 		}
 
 		console.log(`Cache MISS for: ${request.url}`);
@@ -84,13 +90,19 @@ export default {
 		try {
 			const response = await handleRequest(request, env);
 
-			// Add cache miss header before caching and returning
-			response.headers.set('X-Cache-Status', 'MISS');
+			// Create a new response to add the cache-status header
+			const headers = new Headers(response.headers);
+			headers.set('X-Cache-Status', 'MISS');
+			const finalResponse = new Response(response.body, {
+				status: response.status,
+				statusText: response.statusText,
+				headers,
+			});
 
 			// Asynchronously cache the successful response
-			ctx.waitUntil(cache.put(request, response.clone()));
+			ctx.waitUntil(cache.put(request, finalResponse.clone()));
 
-			return response;
+			return finalResponse;
 		} catch (error) {
 			console.error('Worker error:', error);
 			const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
@@ -191,15 +203,25 @@ async function serveTransformedImage(pathname: string, options: CfImageTransform
 	const transformedResponse = await fetchFromR2(pathname, options, env);
 
 	if (transformedResponse.ok) {
-		transformedResponse.headers.set('X-Transform-Status', 'success');
-		return transformedResponse;
+		const headers = new Headers(transformedResponse.headers);
+		headers.set('X-Transform-Status', 'success');
+		return new Response(transformedResponse.body, {
+			status: transformedResponse.status,
+			statusText: transformedResponse.statusText,
+			headers,
+		});
 	}
 
 	// Fallback: If transformation fails, serve the original image.
 	console.warn(`Image transformation failed with status ${transformedResponse.status}. Falling back to original.`);
 	const fallbackResponse = await fetchFromR2(pathname, {}, env);
-	fallbackResponse.headers.set('X-Transform-Status', 'fallback-original');
-	return fallbackResponse;
+	const headers = new Headers(fallbackResponse.headers);
+	headers.set('X-Transform-Status', 'fallback-original');
+	return new Response(fallbackResponse.body, {
+		status: fallbackResponse.status,
+		statusText: fallbackResponse.statusText,
+		headers,
+	});
 }
 
 /**
