@@ -1,3 +1,4 @@
+import { waitUntil } from "cloudflare:workers";
 /**
  * Welcome to Cloudflare Workers!
  *
@@ -79,7 +80,7 @@ export default {
 			const response = createResponseWithHeaders(originalResponse, { 'X-Cache-Status': 'MISS' });
 
 			// Asynchronously cache the successful response
-			ctx.waitUntil(cache.put(request, response.clone()));
+			waitUntil(cache.put(request, response.clone()));
 
 			return response;
 		} catch (error) {
@@ -91,7 +92,7 @@ export default {
 			});
 		}
 	},
-} satisfies ExportedHandler;
+} satisfies ExportedHandler<Env>;
 
 // --- Helper Functions for Modularity and Readability ---
 
