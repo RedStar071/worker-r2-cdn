@@ -26,7 +26,6 @@
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
 	 */
 	"vars": {
-		"R2_PUBLIC_URL": "https://9594839a2728caa012af14c0b7ef8c79.r2.cloudflarestorage.com/wolfstar-cdn",
 		"ALLOWED_ORIGINS": "https://www.wolfstar.rocks,https://wolfstar.rocks",
 		"R2_WORKER_URL": "worker-r2-cdn.redstar071.workers.dev"
 	},
@@ -49,5 +48,14 @@
       "bucket_name": "wolfstar-cdn",
       "binding": "wolfstar_cdn"
     }
-  ]
+  ],
+	"kv_namespaces": [
+		{
+			"binding": "KV_RATELIMIT",
+			// Replace with your actual KV namespace ID for production
+			"id": "production_kv_id_placeholder",
+			// Replace with your actual KV namespace ID for local/preview development
+			"preview_id": "preview_kv_id_placeholder"
+		}
+	]
 }
