@@ -24,9 +24,9 @@
 	"bindings": {
 		"RATE_LIMITER": {
 			"type": "rate_limit",
-			"namespace_id": "YOUR_NAMESPACE_ID", // Replace with your Production Rate Limiting Namespace ID
+			"namespace_id": "1", // Replace with your Production Rate Limiting Namespace ID
 			"simple": {
-				"limit": 100,
+				"limit": 20,
 				"period": 60
 			}
 		}
