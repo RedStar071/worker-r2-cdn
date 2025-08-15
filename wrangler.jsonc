@@ -8,7 +8,7 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2025-08-06",
 	"observability": {
-		"enabled": true,
+		"enabled": true
 	},
 	/**
 	 * Smart Placement
@@ -21,6 +21,16 @@
 	 * databases, object storage, AI inference, real-time communication and more.
 	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
 	 */
+	"bindings": {
+		"RATE_LIMITER": {
+			"type": "rate_limit",
+			"namespace_id": "YOUR_NAMESPACE_ID", // Replace with your Production Rate Limiting Namespace ID
+			"simple": {
+				"limit": 100,
+				"period": 60
+			}
+		}
+	},
 	/**
 	 * Environment Variables
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
@@ -44,17 +54,9 @@
 	 */
 	// "services": [{ "binding": "MY_SERVICE", "service": "my-service" }],
 	"r2_buckets": [
-    {
-      "bucket_name": "wolfstar-cdn",
-      "binding": "wolfstar_cdn"
-    }
-  ],
-	"bindings": {
-		"RATE_LIMITER": {
-			"type": "rate_limit",
-			// This defines the binding name. The actual rate limit (e.g., 100 requests/minute)
-			// must be configured in the Cloudflare dashboard under Workers & Pages > Rate Limiting.
-			"namespace_id": "1" // Replace with your Rate Limiting Namespace ID
+		{
+			"bucket_name": "wolfstar-cdn",
+			"binding": "wolfstar_cdn"
 		}
-	}
+	]
 }
