@@ -70,6 +70,22 @@ export default {
 			return handleCorsPreflight(env);
 		}
 
+		// Rate limiting
+		const clientIP = request.headers.get('cf-connecting-ip');
+		if (clientIP && env.KV_RATELIMIT) {
+			const rateLimitKey = `ratelimit:${clientIP}`;
+			const currentRequests = parseInt((await env.KV_RATELIMIT.get(rateLimitKey)) || '0');
+
+			if (currentRequests > 100) {
+				return new Response('Rate limit exceeded', { status: 429 });
+			}
+
+			await env.KV_RATELIMIT.put(rateLimitKey, (currentRequests + 1).toString(), {
+				expirationTtl: 60, // 60 seconds
+			});
+		}
+
+
 		const cache = caches.default;
 		const cachedResponse = await cache.match(request);
 
@@ -108,10 +124,6 @@ export default {
 async function handleRequest(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	const { pathname, searchParams } = url;
-
-	if (!env.R2_PUBLIC_URL) {
-		throw new Error('R2_PUBLIC_URL environment variable is not configured.');
-	}
 
 	const fileExtension = pathname.split('.').pop()?.toLowerCase() ?? '';
 	const isImage = IMAGE_EXTENSIONS.has(fileExtension);
@@ -234,43 +246,27 @@ async function serveTransformedImage(pathname: string, options: CfImageTransform
 async function fetchFromR2(pathname: string, cfOptions: CfImageTransformOptions, env: Env): Promise<Response> {
 	const objectKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
 
-	// First, check if the object exists using the R2 binding for efficiency.
-	const head = await env.wolfstar_cdn.head(objectKey);
-	if (head === null) {
-		console.error(`Object head not found in R2 bucket. Key: ${objectKey}`);
+	const object = await env.wolfstar_cdn.get(objectKey);
+
+	if (object === null) {
+		console.error(`Object not found in R2 bucket. Key: ${objectKey}`);
 		return new Response(`Object Not Found: ${objectKey}`, { status: 404 });
 	}
 
-	// If the object exists, use the public URL with fetch to apply transformations.
-	const r2Url = getR2Url(pathname, env);
-	const r2Response = await fetch(r2Url, { cf: { image: cfOptions } });
-
-	if (!r2Response.ok) {
-		// This might still happen for other reasons (e.g., permissions), but we've already handled 404s.
-		return r2Response;
-	}
-
-	const headers = new Headers(r2Response.headers);
+	const headers = new Headers();
+	object.writeHttpMetadata(headers);
+	headers.set('etag', object.httpEtag);
 	headers.set('Cache-Control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
-	headers.set('Vary', 'Accept'); // Important for content negotiation
-	head.writeHttpMetadata(headers);
-	headers.set("etag", head.httpEtag);
+	headers.set('Vary', 'Accept');
 	appendCorsHeaders(headers, env);
 
-	return new Response(r2Response.body, {
-		status: r2Response.status,
-		statusText: r2Response.statusText,
+	// The `cf` property is only respected when the response body is from a `fetch` call.
+	// However, for R2 objects, we can return the body directly and Cloudflare will
+	// still apply the transformations based on the `cf` property on the *response*.
+	return new Response(object.body, {
 		headers,
+		cf: { image: cfOptions },
 	});
-}
-
-/**
- * Constructs the full public URL for an R2 object.
- */
-function getR2Url(pathname: string, env: Env): string {
-	// R2 public URL doesn't need a leading slash on the object key
-	const objectKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
-	return `${env.R2_PUBLIC_URL}/${objectKey}`;
 }
 
 /**
