@@ -49,13 +49,12 @@
       "binding": "wolfstar_cdn"
     }
   ],
-	"kv_namespaces": [
-		{
-			"binding": "KV_RATELIMIT",
-			// Replace with your actual KV namespace ID for production
-			"id": "production_kv_id_placeholder",
-			// Replace with your actual KV namespace ID for local/preview development
-			"preview_id": "preview_kv_id_placeholder"
+	"bindings": {
+		"RATE_LIMITER": {
+			"type": "rate_limit",
+			// This defines the binding name. The actual rate limit (e.g., 100 requests/minute)
+			// must be configured in the Cloudflare dashboard under Workers & Pages > Rate Limiting.
+			"namespace_id": "1" // Replace with your Rate Limiting Namespace ID
 		}
-	]
+	}
 }
