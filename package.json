@@ -7,17 +7,18 @@
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
 		"cf-typegen": "wrangler types",
-		"format": "prettier --write .",
+		"format": "biome format --write --no-errors-on-unmatched .",
 		"prepare": "husky"
 	},
 	"devDependencies": {
+		"@biomejs/biome": "2.2.0",
 		"husky": "^9.1.7",
-		"prettier": "^3.6.2",
 		"typescript": "^5.5.2",
 		"wrangler": "^4.28.0"
 	},
 	"packageManager": "pnpm@10.13.1",
 	"lint-staged": {
-		"*.{js,css,md}": "prettier --write"
+		"*.{js,ts,cjs,mjs,d.cts,d.mts,jsx,tsx,json,jsonc}": ["biome format --write --no-errors-on-unmatched"],
+		"*": ["biome format --no-errors-on-unmatched --files-ignore-unknown=true"]
 	}
 }

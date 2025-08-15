@@ -1,4 +1,4 @@
-import { waitUntil } from "cloudflare:workers";
+import { waitUntil } from 'cloudflare:workers';
 /**
  * Welcome to Cloudflare Workers!
  *
@@ -58,7 +58,7 @@ const IMMUTABLE_CACHE_TTL = 31536000; // 1 year
 const DEFAULT_CACHE_TTL = 86400; // 1 day
 
 const DEFAULT_TRANSFORM_OPTIONS: Readonly<Partial<CfImageTransformOptions>> = {
-	quality: 85
+	quality: 85,
 };
 
 // --- Main Worker Handler ---

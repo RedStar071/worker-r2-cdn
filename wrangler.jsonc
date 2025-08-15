@@ -21,15 +21,18 @@
 	 * databases, object storage, AI inference, real-time communication and more.
 	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
 	 */
-	"bindings": {
-		"RATE_LIMITER": {
-			"type": "rate_limit",
-			"namespace_id": "1", // Replace with your Production Rate Limiting Namespace ID
-			"simple": {
-				"limit": 20,
-				"period": 60
+	"unsafe": {
+		"bindings": [
+			{
+				"name": "RATE_LIMITER",
+				"type": "rate_limit",
+				"namespace_id": "1", // Replace with your Production Rate Limiting Namespace ID
+				"simple": {
+					"limit": 20,
+					"period": 60
+				}
 			}
-		}
+		]
 	},
 	/**
 	 * Environment Variables
