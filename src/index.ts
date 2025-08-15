@@ -314,5 +314,3 @@ function createResponseWithHeaders(response: Response, newHeaders: Record<string
 		headers,
 	});
 }
-
-
