@@ -70,21 +70,16 @@ export default {
 			return handleCorsPreflight(env);
 		}
 
-		// Rate limiting
-		const clientIP = request.headers.get('cf-connecting-ip');
-		if (clientIP && env.KV_RATELIMIT) {
-			const rateLimitKey = `ratelimit:${clientIP}`;
-			const currentRequests = parseInt((await env.KV_RATELIMIT.get(rateLimitKey)) || '0');
-
-			if (currentRequests > 100) {
-				return new Response('Rate limit exceeded', { status: 429 });
+		// Use the native rate limiter binding
+		if (env.RATE_LIMITER) {
+			const clientIP = request.headers.get('cf-connecting-ip');
+			if (clientIP) {
+				const { success } = await env.RATE_LIMITER.limit({ key: clientIP });
+				if (!success) {
+					return new Response('Rate limit exceeded', { status: 429 });
+				}
 			}
-
-			await env.KV_RATELIMIT.put(rateLimitKey, (currentRequests + 1).toString(), {
-				expirationTtl: 60, // 60 seconds
-			});
 		}
-
 
 		const cache = caches.default;
 		const cachedResponse = await cache.match(request);
@@ -260,9 +255,9 @@ async function fetchFromR2(pathname: string, cfOptions: CfImageTransformOptions,
 	headers.set('Vary', 'Accept');
 	appendCorsHeaders(headers, env);
 
-	// The `cf` property is only respected when the response body is from a `fetch` call.
-	// However, for R2 objects, we can return the body directly and Cloudflare will
-	// still apply the transformations based on the `cf` property on the *response*.
+	// By returning the R2 object's body directly in the response and including
+	// the `cf.image` property, we instruct Cloudflare to perform the image
+	// transformations without needing a public URL.
 	return new Response(object.body, {
 		headers,
 		cf: { image: cfOptions },
