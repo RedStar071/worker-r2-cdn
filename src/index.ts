@@ -11,42 +11,9 @@ import { compress } from 'hono/compress';
 
 // ==== Definizioni di Tipo ====
 
-// R2 & Cloudflare Bindings
-interface RateLimiterBinding {
-	limit(input: { key: string }): Promise<{ success: boolean }>;
-}
-
-interface R2Range {
-	offset: number;
-	length?: number;
-}
-
-interface R2Object {
-	key: string;
-	size: number;
-	httpEtag: string;
-	uploaded: Date;
-	writeHttpMetadata(headers: Headers): void;
-}
-
-interface R2ObjectBody extends R2Object {
-	body: ReadableStream;
-	range?: { offset: number; length: number };
-}
-
-interface R2GetOptions {
-	range?: R2Range;
-	onlyIf?: { etagMatches?: string };
-}
-
-interface R2Bucket {
-	head(key: string): Promise<R2Object | null>;
-	get(key: string, options?: R2GetOptions): Promise<R2ObjectBody | null>;
-}
-
 interface Env {
 	wolfstar_cdn: R2Bucket;
-	RATE_LIMITER?: RateLimiterBinding;
+	RATE_LIMITER?: RateLimit;
 	ALLOWED_ORIGINS?: string;
 }
 
@@ -215,9 +182,24 @@ async function fetchFromR2(
 
 		// Gestione risposte parziali (range)
 		if (range && object.range) {
-			const start = object.range.offset;
-			const len = object.range.length;
-			const end = start + (len ? len - 1 : 0);
+			let start: number;
+			let end: number;
+
+			if ('offset' in object.range && 'length' in object.range) {
+				start = object.range.offset ?? 0;
+				const length = object.range.length ?? object.size - start;
+				end = start + length - 1;
+			} else if ('offset' in object.range) {
+				start = object.range.offset ?? 0;
+				end = object.size - 1;
+			} else if ('suffix' in object.range) {
+				start = object.size - (object.range.suffix ?? 0);
+				end = object.size - 1;
+			} else {
+				// Caso imprevisto, fallback a una risposta completa
+				return new Response(object.body, { headers });
+			}
+
 			headers.set('content-range', `bytes ${start}-${end}/${object.size}`);
 
 			return new Response(object.body, {
