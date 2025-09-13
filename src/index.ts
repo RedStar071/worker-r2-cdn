@@ -54,7 +54,13 @@ const DEFAULT_TRANSFORM_OPTIONS: Readonly<Partial<CfImageTransformOptions>> = {
  * Type guard per R2ObjectBody
  */
 function isR2ObjectBody(obj: any): obj is R2ObjectBody {
-	return !!obj && 'body' in obj;
+	return (
+		!!obj &&
+		typeof obj === 'object' &&
+		'body' in obj &&
+		'size' in obj &&
+		'httpEtag' in obj
+	);
 }
 
 /**
