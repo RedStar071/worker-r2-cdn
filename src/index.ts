@@ -1,316 +1,232 @@
-import { waitUntil } from 'cloudflare:workers';
-/**
- * Welcome to Cloudflare Workers!
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
-/**
- * Welcome to Cloudflare Workers!
- *
- * This worker acts as an intelligent image resizing proxy.
- * It fetches original images from an R2 bucket, applies transformations
- * using Cloudflare Image Resizing based on URL query parameters,
- * and caches the results efficiently using the Cache API.
- */
-
-// --- Type Definitions for Clarity and Type Safety ---
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { logger } from 'hono/logger';
+import { secureHeaders } from 'hono/secure-headers';
+import { compress } from 'hono/compress';
+import { etag } from 'hono/etag';
+import { createErrorResponse, fetchFromR2, getAllowedOrigins as origin, handleRateLimit, parseTransformations } from './utils';
+import type { CloudflareEnv, HealthResponse } from './types';
 
 /**
- * Cloudflare Image Resizing options for the 'fit' parameter.
+ * Wolfstar CDN - Image Delivery & Transformation Service
+ * Optimized for Cloudflare Workers and R2 Storage.
+ * This worker handles fetching images from R2, applying transformations,
+ * and serving them with appropriate caching and security headers.
  */
-type CfImageFit = 'scale-down' | 'contain' | 'cover' | 'crop' | 'pad';
+
+// ==== Hono App Setup ====
 
 /**
- * Supported output image formats.
+ * Initializes a new Hono application instance.
+ * The `CloudflareEnv` type provides access to Cloudflare-specific bindings.
  */
-type CfImageFormat = 'webp' | 'avif' | 'jpeg' | 'png' | 'json';
+const app = new Hono<CloudflareEnv>();
+
+// ==== Middleware ====
 
 /**
- * Interface for the object passed to the `cf.image` property for transformations.
+ * Centralized error handling for the application.
+ * Catches any unhandled errors, logs them, and returns a standardized JSON error response.
  */
-interface CfImageTransformOptions {
-	width?: number;
-	height?: number;
-	quality?: number;
-	fit?: CfImageFit;
-	format?: CfImageFormat;
-}
+app.onError((err) => {
+	console.error('Unhandled error:', err);
+	return createErrorResponse('INTERNAL_ERROR', 'An unexpected error occurred', 500);
+});
 
 /**
- * Defines the environment variables expected by the worker.
- * Regenerate with `npm run cf-typegen` after updating wrangler.jsonc.
+ * Enables automatic response compression (Gzip/Brotli) for all routes.
+ * This reduces bandwidth usage and improves loading times.
  */
+app.use('*', compress());
 
-// --- Constants for Configuration and Maintainability ---
+/**
+ * Adds ETag headers to all responses for efficient client-side caching.
+ * The client can use the ETag to conditionally request content.
+ */
+app.use('/*', etag());
 
-const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'tiff', 'avif']);
-const ALLOWED_FIT_MODES = new Set<CfImageFit>(['scale-down', 'contain', 'cover', 'crop', 'pad']);
-const ALLOWED_FORMATS = new Set<CfImageFormat>(['webp', 'avif', 'jpeg', 'png', 'json']);
-const CORS_MAX_AGE = '86400'; // 24 hours
-const IMMUTABLE_CACHE_TTL = 31536000; // 1 year
-const DEFAULT_CACHE_TTL = 86400; // 1 day
+/**
+ * Applies a set of important security headers to all responses.
+ * These headers help mitigate common web vulnerabilities like XSS and clickjacking.
+ */
+app.use(
+	'*',
+	secureHeaders({
+		xContentTypeOptions: 'nosniff',
+		xFrameOptions: 'DENY',
+		xXssProtection: '1; mode=block',
+	}),
+);
 
-const DEFAULT_TRANSFORM_OPTIONS: Readonly<Partial<CfImageTransformOptions>> = {
-	quality: 85,
-};
+/**
+ * Configures Cross-Origin Resource Sharing (CORS) for the CDN.
+ * It dynamically allows origins based on environment variables for improved security.
+ */
+app.use(
+	'*',
+	cors({
+		origin,
+		allowMethods: ['GET', 'HEAD', 'OPTIONS'],
+		allowHeaders: ['Content-Type', 'Range', 'If-Range', 'If-None-Match'],
+		exposeHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length'],
+		maxAge: 86400, // Cache preflight response for 24 hours
+		credentials: false,
+	}),
+);
 
-// --- Main Worker Handler ---
+/**
+ * Minimalist request logger.
+ * Outputs basic information about each incoming request to the console.
+ */
+app.use('*', logger());
 
-export default {
-	async fetch(request, env, _ctx): Promise<Response> {
-		// Handle CORS preflight requests first
-		if (request.method === 'OPTIONS') {
-			return handleCorsPreflight(env);
+/**
+ * Implements rate limiting to protect the service from abuse.
+ * It uses the client's IP address and a Cloudflare Rate Limiter binding.
+ */
+app.use('*', async (c, next) => {
+	// Skip if the rate limiter is not configured
+	if (!c.env.RATE_LIMITER) return next();
+
+	// Determine the client's IP address from headers
+	const clientIP = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip');
+
+	if (!clientIP) {
+		console.warn('Unable to determine client IP for rate limiting');
+		return next();
+	}
+
+	// Check if the request is allowed by the rate limiter
+	const isAllowed = await handleRateLimit(clientIP, c.env.RATE_LIMITER);
+	if (!isAllowed) {
+		return createErrorResponse('RATE_LIMITED', 'Too many requests', 429);
+	}
+
+	await next();
+});
+
+/**
+ * Implements a cache-aside strategy using the Cloudflare Cache API.
+ * It caches successful responses to reduce R2 reads and improve performance.
+ */
+app.use('/*', async (c, next) => {
+	// Skip caching for the health check endpoint
+	if (c.req.path === '/health') return next();
+
+	try {
+		const cache = caches.default;
+		const url = new URL(c.req.url);
+
+		// Create a cache key that respects Range and Accept-Encoding headers
+		// to prevent serving incorrect cached content.
+		const cacheKeyHeaders = new Headers();
+		const range = c.req.header('range');
+		const encoding = c.req.header('accept-encoding');
+
+		if (range) cacheKeyHeaders.set('range', range);
+		if (encoding) cacheKeyHeaders.set('accept-encoding', encoding);
+
+		const cacheKey = new Request(url.toString(), { headers: cacheKeyHeaders });
+		const cachedResponse = await cache.match(cacheKey);
+
+		// If a cached response is found, return it immediately
+		if (cachedResponse) {
+			const response = new Response(cachedResponse.body, cachedResponse);
+			response.headers.set('X-Cache-Status', 'HIT');
+			return response;
 		}
 
-		// Use the native rate limiter binding
-		if (env.RATE_LIMITER) {
-			const clientIP = request.headers.get('cf-connecting-ip');
-			if (clientIP) {
-				const { success } = await env.RATE_LIMITER.limit({ key: clientIP });
-				if (!success) {
-					return new Response('Rate limit exceeded', { status: 429 });
-				}
+		// If not in cache, proceed to the next middleware/handler
+		await next();
+
+		// Cache the response only if it was successful (status 2xx)
+		if (c.res?.ok) {
+			const response = c.res.clone();
+			response.headers.set('X-Cache-Status', 'MISS');
+
+			// Asynchronously store the response in the cache without blocking the response to the client
+			if (c.executionCtx) {
+				c.executionCtx.waitUntil(
+					cache.put(cacheKey, response.clone()).catch((error) => {
+						console.error('Cache storage error:', error);
+					}),
+				);
+			} else {
+				// Fallback for synchronous storage if execution context is not available
+				cache.put(cacheKey, response.clone()).catch((error) => {
+					console.error('Cache storage error:', error);
+				});
 			}
 		}
+	} catch (error) {
+		console.error('Cache middleware error:', error);
+		// If an error occurs in the cache middleware, proceed without caching
+		await next();
+	}
+});
 
-		const cache = caches.default;
-		const cachedResponse = await cache.match(request);
+// ==== Main Route ====
 
-		if (cachedResponse) {
-			console.log(`Cache HIT for: ${request.url}`);
-			// Return a new response with our custom cache header
-			return createResponseWithHeaders(cachedResponse, { 'X-Cache-Status': 'HIT' });
+/**
+ * Main route for handling all incoming asset requests.
+ * It determines if the request is for an image or a static file and handles it accordingly.
+ */
+app.get('/*', async (c) => {
+	try {
+		const { pathname, searchParams } = new URL(c.req.url);
+		const isHeadRequest = c.req.method === 'HEAD';
+		const rangeHeader = c.req.header('range');
+
+		// For images, parse transformation options from the URL query parameters
+		const transformOptions = parseTransformations(pathname, searchParams);
+
+		// Image transformations do not support Range requests.
+		if (rangeHeader) {
+			return createErrorResponse('RANGE_NOT_SUPPORTED', 'Range requests are not supported for image transformations', 400);
 		}
 
-		console.log(`Cache MISS for: ${request.url}`);
+		// Serve the transformed image
+		return await fetchFromR2(pathname, transformOptions, c, isHeadRequest, rangeHeader);
+	} catch (error) {
+		console.error('Request handler error:', error);
+		const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+		return createErrorResponse('REQUEST_ERROR', errorMessage, 500);
+	}
+});
 
-		try {
-			const originalResponse = await handleRequest(request, env);
-			const response = createResponseWithHeaders(originalResponse, { 'X-Cache-Status': 'MISS' });
-
-			// Asynchronously cache the successful response
-			waitUntil(cache.put(request, response.clone()));
-
-			return response;
-		} catch (error) {
-			console.error('Worker error:', error);
-			const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-			return new Response(`Internal Server Error: ${errorMessage}`, {
-				status: 500,
-				headers: getCorsHeaders(env),
-			});
-		}
-	},
-} satisfies ExportedHandler<Env>;
-
-// --- Helper Functions for Modularity and Readability ---
+// ==== Health & Monitoring ====
 
 /**
- * Handles the main request logic after a cache miss.
+ * Health check endpoint for monitoring the worker's status.
+ * Returns a JSON response with status, timestamp, and region information.
+ * This endpoint is excluded from caching.
  */
-async function handleRequest(request: Request, env: Env): Promise<Response> {
-	const url = new URL(request.url);
-	const { pathname, searchParams } = url;
-
-	const fileExtension = pathname.split('.').pop()?.toLowerCase() ?? '';
-	const isImage = IMAGE_EXTENSIONS.has(fileExtension);
-
-	if (!isImage) {
-		return serveStaticFile(pathname, env);
-	}
-
-	const transformOptions = parseTransformations(searchParams);
-	const hasTransformations = Object.keys(transformOptions).length > 0;
-
-	if (!hasTransformations) {
-		return serveOriginalImage(pathname, env);
-	}
-
-	return serveTransformedImage(pathname, transformOptions, env);
-}
-
-/**
- * Parses and validates image transformation parameters from the URL.
- */
-function parseTransformations(searchParams: URLSearchParams): CfImageTransformOptions {
-	const hasTransformationParams = ['w', 'h', 'q', 'fit', 'f'].some((p) => searchParams.has(p));
-	if (!hasTransformationParams) {
-		return {};
-	}
-
-	const options: CfImageTransformOptions = { ...DEFAULT_TRANSFORM_OPTIONS };
-
-	const widthParam = searchParams.get('w');
-	if (widthParam) {
-		const width = parseInt(widthParam, 10);
-		if (!isNaN(width) && width > 0) {
-			options.width = width;
-		}
-	}
-
-	const heightParam = searchParams.get('h');
-	if (heightParam) {
-		const height = parseInt(heightParam, 10);
-		if (!isNaN(height) && height > 0) {
-			options.height = height;
-		}
-	}
-
-	const qualityParam = searchParams.get('q');
-	if (qualityParam) {
-		const quality = parseInt(qualityParam, 10);
-		if (!isNaN(quality) && quality > 0 && quality <= 100) {
-			options.quality = quality;
-		}
-	}
-
-	const fitParam = searchParams.get('fit') as CfImageFit;
-	if (fitParam && ALLOWED_FIT_MODES.has(fitParam)) {
-		options.fit = fitParam;
-	}
-
-	const formatParam = searchParams.get('f')?.toLowerCase() as CfImageFormat;
-	if (formatParam && ALLOWED_FORMATS.has(formatParam)) {
-		options.format = formatParam;
-	}
-
-	return options;
-}
-
-/**
- * Fetches and serves a non-image file directly from R2.
- */
-async function serveStaticFile(pathname: string, env: Env): Promise<Response> {
-	const objectKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
-	const object = await env.wolfstar_cdn.get(objectKey);
-
-	if (object === null) {
-		console.error(`Object not found in R2 bucket. Key: ${objectKey}`);
-		return new Response(`Object Not Found: ${objectKey}`, { status: 404 });
-	}
-
-	const headers = new Headers();
-	object.writeHttpMetadata(headers);
-	headers.set('etag', object.httpEtag);
-	headers.set('Cache-Control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
-	headers.set('Vary', 'Accept'); // Important for content negotiation
-	appendCorsHeaders(headers, env);
-
-	return new Response(object.body, {
-		headers,
-	});
-}
-
-/**
- * Serves the original image without any transformations.
- */
-async function serveOriginalImage(pathname: string, env: Env): Promise<Response> {
-	return fetchFromR2(pathname, {}, env);
-}
-
-/**
- * Serves a transformed image using Cloudflare Image Resizing.
- * Includes fallback to the original image if transformation fails.
- */
-async function serveTransformedImage(pathname: string, options: CfImageTransformOptions, env: Env): Promise<Response> {
-	console.log('Applying transform options:', JSON.stringify(options));
-
-	const transformedResponse = await fetchFromR2(pathname, options, env);
-
-	if (transformedResponse.ok) {
-		return createResponseWithHeaders(transformedResponse, { 'X-Transform-Status': 'success' });
-	}
-
-	// Fallback: If transformation fails, serve the original image.
-	console.warn(`Image transformation failed with status ${transformedResponse.status}. Falling back to original.`);
-	const fallbackResponse = await fetchFromR2(pathname, {}, env);
-	return createResponseWithHeaders(fallbackResponse, { 'X-Transform-Status': 'fallback-original' });
-}
-
-/**
- * Generic function to fetch an image from R2, optionally applying transformations.
- */
-async function fetchFromR2(pathname: string, cfOptions: CfImageTransformOptions, env: Env): Promise<Response> {
-	const objectKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
-
-	const object = await env.wolfstar_cdn.get(objectKey);
-
-	if (object === null) {
-		console.error(`Object not found in R2 bucket. Key: ${objectKey}`);
-		return new Response(`Object Not Found: ${objectKey}`, { status: 404 });
-	}
-
-	const headers = new Headers();
-	object.writeHttpMetadata(headers);
-	headers.set('etag', object.httpEtag);
-	headers.set('Cache-Control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
-	headers.set('Vary', 'Accept');
-	appendCorsHeaders(headers, env);
-
-	// By returning the R2 object's body directly in the response and including
-	// the `cf.image` property, we instruct Cloudflare to perform the image
-	// transformations without needing a public URL.
-	return new Response(object.body, {
-		headers,
-		cf: { image: cfOptions },
-	});
-}
-
-/**
- * Returns a response for CORS preflight (OPTIONS) requests.
- */
-function handleCorsPreflight(env: Env): Response {
-	return new Response(null, {
-		status: 204, // No Content
-		headers: getCorsHeaders(env),
-	});
-}
-
-/**
- * Returns an object with the appropriate CORS headers.
- */
-function getCorsHeaders(env: Env): Record<string, string> {
-	return {
-		'Access-Control-Allow-Origin': env.ALLOWED_ORIGINS || '*',
-		'Access-Control-Allow-Methods': 'GET, OPTIONS',
-		'Access-Control-Allow-Headers': 'Content-Type',
-		'Access-Control-Max-Age': CORS_MAX_AGE,
+app.get('/health', (c) => {
+	const data: HealthResponse = {
+		status: 'ok',
+		timestamp: new Date().toISOString(),
+		worker: 'wolfstar-cdn',
+		region: c.req.header('cf-ray')?.split('-')[1], // Extract region from CF-Ray header
 	};
-}
 
-/**
- * Appends CORS headers to an existing Headers object.
- */
-function appendCorsHeaders(headers: Headers, env: Env): void {
-	const cors = getCorsHeaders(env);
-	for (const key in cors) {
-		headers.set(key, cors[key]);
-	}
-}
-
-/**
- * Creates a new Response with additional or overwritten headers.
- * @param response The original response.
- * @param newHeaders An object of headers to add or overwrite.
- * @returns A new Response object with the modified headers.
- */
-function createResponseWithHeaders(response: Response, newHeaders: Record<string, string>): Response {
-	const headers = new Headers(response.headers);
-	for (const [key, value] of Object.entries(newHeaders)) {
-		headers.set(key, value);
-	}
-
-	return new Response(response.body, {
-		status: response.status,
-		statusText: response.statusText,
-		headers,
+	return c.json(data, 200, {
+		'Cache-Control': 'no-store', // Ensure this response is never cached
+		'X-Robots-Tag': 'noindex', // Prevent search engines from indexing this page
 	});
-}
+});
+
+// ==== 404 Handler ====
+
+/**
+ * Handles all requests that do not match any other route.
+ * Returns a standardized 404 Not Found error response.
+ */
+app.notFound(() => {
+	return createErrorResponse('NOT_FOUND', 'The requested resource was not found', 404);
+});
+
+/**
+ * Default export of the Hono app.
+ * This is the entry point for the Cloudflare Worker.
+ */
+export default app;
