@@ -1,40 +1,59 @@
-import { waitUntil } from 'cloudflare:workers';
-/**
- * Welcome to Cloudflare Workers!
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
-/**
- * Welcome to Cloudflare Workers!
- *
- * This worker acts as an intelligent image resizing proxy.
- * It fetches original images from an R2 bucket, applies transformations
- * using Cloudflare Image Resizing based on URL query parameters,
- * and caches the results efficiently using the Cache API.
- */
-
-// --- Type Definitions for Clarity and Type Safety ---
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { logger } from 'hono/logger';
+import { secureHeaders } from 'hono/secure-headers';
+import { compress } from 'hono/compress';
 
 /**
- * Cloudflare Image Resizing options for the 'fit' parameter.
+ * Wolfstar CDN - Image Delivery & Transformation Service
+ * Ottimizzato per Cloudflare Workers e R2
  */
+
+// ==== Definizioni di Tipo ====
+
+// R2 & Cloudflare Bindings
+interface RateLimiterBinding {
+	limit(input: { key: string }): Promise<{ success: boolean }>;
+}
+
+interface R2Range {
+	offset: number;
+	length?: number;
+}
+
+interface R2Object {
+	key: string;
+	size: number;
+	httpEtag: string;
+	uploaded: Date;
+	writeHttpMetadata(headers: Headers): void;
+}
+
+interface R2ObjectBody extends R2Object {
+	body: ReadableStream;
+	range?: { offset: number; length: number };
+}
+
+interface R2GetOptions {
+	range?: R2Range;
+	onlyIf?: { etagMatches?: string };
+}
+
+interface R2Bucket {
+	head(key: string): Promise<R2Object | null>;
+	get(key: string, options?: R2GetOptions): Promise<R2ObjectBody | null>;
+}
+
+interface Env {
+	wolfstar_cdn: R2Bucket;
+	RATE_LIMITER?: RateLimiterBinding;
+	ALLOWED_ORIGINS?: string;
+}
+
+// Tipi per trasformazione immagini
 type CfImageFit = 'scale-down' | 'contain' | 'cover' | 'crop' | 'pad';
-
-/**
- * Supported output image formats.
- */
 type CfImageFormat = 'webp' | 'avif' | 'jpeg' | 'png' | 'json';
 
-/**
- * Interface for the object passed to the `cf.image` property for transformations.
- */
 interface CfImageTransformOptions {
 	width?: number;
 	height?: number;
@@ -43,274 +62,359 @@ interface CfImageTransformOptions {
 	format?: CfImageFormat;
 }
 
-/**
- * Defines the environment variables expected by the worker.
- * Regenerate with `npm run cf-typegen` after updating wrangler.jsonc.
- */
+// Tipi di risposta personalizzati
+interface HealthResponse {
+	status: string;
+	timestamp: string;
+	worker: string;
+	region?: string;
+}
 
-// --- Constants for Configuration and Maintainability ---
+// ==== Costanti ====
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'tiff', 'avif']);
 const ALLOWED_FIT_MODES = new Set<CfImageFit>(['scale-down', 'contain', 'cover', 'crop', 'pad']);
 const ALLOWED_FORMATS = new Set<CfImageFormat>(['webp', 'avif', 'jpeg', 'png', 'json']);
-const CORS_MAX_AGE = '86400'; // 24 hours
-const IMMUTABLE_CACHE_TTL = 31536000; // 1 year
-const DEFAULT_CACHE_TTL = 86400; // 1 day
+const IMMUTABLE_CACHE_TTL = 31536000; // 1 anno (in secondi)
 
 const DEFAULT_TRANSFORM_OPTIONS: Readonly<Partial<CfImageTransformOptions>> = {
 	quality: 85,
 };
 
-// --- Main Worker Handler ---
-
-export default {
-	async fetch(request, env, _ctx): Promise<Response> {
-		// Handle CORS preflight requests first
-		if (request.method === 'OPTIONS') {
-			return handleCorsPreflight(env);
-		}
-
-		// Use the native rate limiter binding
-		if (env.RATE_LIMITER) {
-			const clientIP = request.headers.get('cf-connecting-ip');
-			if (clientIP) {
-				const { success } = await env.RATE_LIMITER.limit({ key: clientIP });
-				if (!success) {
-					return new Response('Rate limit exceeded', { status: 429 });
-				}
-			}
-		}
-
-		const cache = caches.default;
-		const cachedResponse = await cache.match(request);
-
-		if (cachedResponse) {
-			console.log(`Cache HIT for: ${request.url}`);
-			// Return a new response with our custom cache header
-			return createResponseWithHeaders(cachedResponse, { 'X-Cache-Status': 'HIT' });
-		}
-
-		console.log(`Cache MISS for: ${request.url}`);
-
-		try {
-			const originalResponse = await handleRequest(request, env);
-			const response = createResponseWithHeaders(originalResponse, { 'X-Cache-Status': 'MISS' });
-
-			// Asynchronously cache the successful response
-			waitUntil(cache.put(request, response.clone()));
-
-			return response;
-		} catch (error) {
-			console.error('Worker error:', error);
-			const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-			return new Response(`Internal Server Error: ${errorMessage}`, {
-				status: 500,
-				headers: getCorsHeaders(env),
-			});
-		}
-	},
-} satisfies ExportedHandler<Env>;
-
-// --- Helper Functions for Modularity and Readability ---
+// ==== Helper Functions ====
 
 /**
- * Handles the main request logic after a cache miss.
+ * Type guard per R2ObjectBody
  */
-async function handleRequest(request: Request, env: Env): Promise<Response> {
-	const url = new URL(request.url);
-	const { pathname, searchParams } = url;
-
-	const fileExtension = pathname.split('.').pop()?.toLowerCase() ?? '';
-	const isImage = IMAGE_EXTENSIONS.has(fileExtension);
-
-	if (!isImage) {
-		return serveStaticFile(pathname, env);
-	}
-
-	const transformOptions = parseTransformations(searchParams);
-	const hasTransformations = Object.keys(transformOptions).length > 0;
-
-	if (!hasTransformations) {
-		return serveOriginalImage(pathname, env);
-	}
-
-	return serveTransformedImage(pathname, transformOptions, env);
+function isR2ObjectBody(obj: any): obj is R2ObjectBody {
+	return !!obj && 'body' in obj;
 }
 
 /**
- * Parses and validates image transformation parameters from the URL.
+ * Estrae l'estensione del file dal percorso
+ */
+function getFileExtension(pathname: string): string {
+	return pathname.split('.').pop()?.toLowerCase() ?? '';
+}
+
+/**
+ * Normalizza il percorso per R2
+ */
+function normalizeObjectKey(pathname: string): string {
+	return pathname.startsWith('/') ? pathname.slice(1) : pathname;
+}
+
+/**
+ * Analizza le trasformazioni dalle query params
  */
 function parseTransformations(searchParams: URLSearchParams): CfImageTransformOptions {
 	const hasTransformationParams = ['w', 'h', 'q', 'fit', 'f'].some((p) => searchParams.has(p));
-	if (!hasTransformationParams) {
-		return {};
-	}
+	if (!hasTransformationParams) return {};
 
 	const options: CfImageTransformOptions = { ...DEFAULT_TRANSFORM_OPTIONS };
 
+	// Larghezza
 	const widthParam = searchParams.get('w');
 	if (widthParam) {
 		const width = parseInt(widthParam, 10);
-		if (!isNaN(width) && width > 0) {
-			options.width = width;
-		}
+		if (!isNaN(width) && width > 0) options.width = width;
 	}
 
+	// Altezza
 	const heightParam = searchParams.get('h');
 	if (heightParam) {
 		const height = parseInt(heightParam, 10);
-		if (!isNaN(height) && height > 0) {
-			options.height = height;
-		}
+		if (!isNaN(height) && height > 0) options.height = height;
 	}
 
+	// Qualità
 	const qualityParam = searchParams.get('q');
 	if (qualityParam) {
 		const quality = parseInt(qualityParam, 10);
-		if (!isNaN(quality) && quality > 0 && quality <= 100) {
-			options.quality = quality;
-		}
+		if (!isNaN(quality) && quality > 0 && quality <= 100) options.quality = quality;
 	}
 
+	// Modalità di adattamento
 	const fitParam = searchParams.get('fit') as CfImageFit;
-	if (fitParam && ALLOWED_FIT_MODES.has(fitParam)) {
-		options.fit = fitParam;
-	}
+	if (fitParam && ALLOWED_FIT_MODES.has(fitParam)) options.fit = fitParam;
 
+	// Formato output
 	const formatParam = searchParams.get('f')?.toLowerCase() as CfImageFormat;
-	if (formatParam && ALLOWED_FORMATS.has(formatParam)) {
-		options.format = formatParam;
-	}
+	if (formatParam && ALLOWED_FORMATS.has(formatParam)) options.format = formatParam;
 
 	return options;
 }
 
 /**
- * Fetches and serves a non-image file directly from R2.
+ * Analizza l'header Range
  */
-async function serveStaticFile(pathname: string, env: Env): Promise<Response> {
-	const objectKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
-	const object = await env.wolfstar_cdn.get(objectKey);
+function parseRangeHeader(rangeHeader: string): R2Range | undefined {
+	const match = rangeHeader.match(/^bytes=(\d+)-(\d*)$/);
+	if (!match) return undefined;
 
-	if (object === null) {
-		console.error(`Object not found in R2 bucket. Key: ${objectKey}`);
-		return new Response(`Object Not Found: ${objectKey}`, { status: 404 });
-	}
+	const start = parseInt(match[1], 10);
+	const end = match[2] ? parseInt(match[2], 10) : undefined;
 
-	const headers = new Headers();
-	object.writeHttpMetadata(headers);
-	headers.set('etag', object.httpEtag);
-	headers.set('Cache-Control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
-	headers.set('Vary', 'Accept'); // Important for content negotiation
-	appendCorsHeaders(headers, env);
+	if (isNaN(start) || (end !== undefined && isNaN(end))) return undefined;
+	if (end !== undefined && start > end) return undefined;
 
-	return new Response(object.body, {
-		headers,
-	});
-}
-
-/**
- * Serves the original image without any transformations.
- */
-async function serveOriginalImage(pathname: string, env: Env): Promise<Response> {
-	return fetchFromR2(pathname, {}, env);
-}
-
-/**
- * Serves a transformed image using Cloudflare Image Resizing.
- * Includes fallback to the original image if transformation fails.
- */
-async function serveTransformedImage(pathname: string, options: CfImageTransformOptions, env: Env): Promise<Response> {
-	console.log('Applying transform options:', JSON.stringify(options));
-
-	const transformedResponse = await fetchFromR2(pathname, options, env);
-
-	if (transformedResponse.ok) {
-		return createResponseWithHeaders(transformedResponse, { 'X-Transform-Status': 'success' });
-	}
-
-	// Fallback: If transformation fails, serve the original image.
-	console.warn(`Image transformation failed with status ${transformedResponse.status}. Falling back to original.`);
-	const fallbackResponse = await fetchFromR2(pathname, {}, env);
-	return createResponseWithHeaders(fallbackResponse, { 'X-Transform-Status': 'fallback-original' });
-}
-
-/**
- * Generic function to fetch an image from R2, optionally applying transformations.
- */
-async function fetchFromR2(pathname: string, cfOptions: CfImageTransformOptions, env: Env): Promise<Response> {
-	const objectKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
-
-	const object = await env.wolfstar_cdn.get(objectKey);
-
-	if (object === null) {
-		console.error(`Object not found in R2 bucket. Key: ${objectKey}`);
-		return new Response(`Object Not Found: ${objectKey}`, { status: 404 });
-	}
-
-	const headers = new Headers();
-	object.writeHttpMetadata(headers);
-	headers.set('etag', object.httpEtag);
-	headers.set('Cache-Control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
-	headers.set('Vary', 'Accept');
-	appendCorsHeaders(headers, env);
-
-	// By returning the R2 object's body directly in the response and including
-	// the `cf.image` property, we instruct Cloudflare to perform the image
-	// transformations without needing a public URL.
-	return new Response(object.body, {
-		headers,
-		cf: { image: cfOptions },
-	});
-}
-
-/**
- * Returns a response for CORS preflight (OPTIONS) requests.
- */
-function handleCorsPreflight(env: Env): Response {
-	return new Response(null, {
-		status: 204, // No Content
-		headers: getCorsHeaders(env),
-	});
-}
-
-/**
- * Returns an object with the appropriate CORS headers.
- */
-function getCorsHeaders(env: Env): Record<string, string> {
 	return {
-		'Access-Control-Allow-Origin': env.ALLOWED_ORIGINS || '*',
-		'Access-Control-Allow-Methods': 'GET, OPTIONS',
-		'Access-Control-Allow-Headers': 'Content-Type',
-		'Access-Control-Max-Age': CORS_MAX_AGE,
+		offset: start,
+		length: end !== undefined ? end - start + 1 : undefined,
 	};
 }
 
+// ==== Funzioni R2 e CDN ====
+
 /**
- * Appends CORS headers to an existing Headers object.
+ * Recupera un oggetto da R2, con supporto per HEAD e Range requests
  */
-function appendCorsHeaders(headers: Headers, env: Env): void {
-	const cors = getCorsHeaders(env);
-	for (const key in cors) {
-		headers.set(key, cors[key]);
+async function fetchFromR2(
+	pathname: string,
+	cfOptions: CfImageTransformOptions,
+	env: Env,
+	isHeadRequest = false,
+	rangeHeader?: string,
+): Promise<Response> {
+	const objectKey = normalizeObjectKey(pathname);
+	const hasTransformations = Object.keys(cfOptions).length > 0;
+
+	try {
+		// Ottimizzazione per HEAD requests
+		if (isHeadRequest) {
+			const headObj = await env.wolfstar_cdn.head(objectKey);
+			if (!headObj) return new Response('Not Found', { status: 404 });
+
+			const headers = new Headers();
+			headObj.writeHttpMetadata(headers);
+			headers.set('etag', headObj.httpEtag);
+			headers.set('accept-ranges', 'bytes');
+			headers.set('cache-control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
+
+			return new Response(null, { headers });
+		}
+
+		// Gestione Range requests (solo per file non trasformati)
+		let range: R2Range | undefined;
+		if (rangeHeader && !hasTransformations) {
+			range = parseRangeHeader(rangeHeader);
+		}
+
+		// Ottimizzazione: evita di scaricare l'oggetto se l'etag corrisponde
+		const options: R2GetOptions = {};
+		if (range) options.range = range;
+
+		const object = await env.wolfstar_cdn.get(objectKey, options);
+		if (!isR2ObjectBody(object)) return new Response('Not Found', { status: 404 });
+
+		const headers = new Headers();
+		object.writeHttpMetadata(headers);
+		headers.set('etag', object.httpEtag);
+		headers.set('accept-ranges', 'bytes');
+		headers.set('cache-control', `public, max-age=${IMMUTABLE_CACHE_TTL}, immutable`);
+
+		// Gestione risposte parziali (range)
+		if (range && object.range) {
+			const start = object.range.offset;
+			const len = object.range.length;
+			const end = start + (len ? len - 1 : 0);
+			headers.set('content-range', `bytes ${start}-${end}/${object.size}`);
+
+			return new Response(object.body, {
+				status: 206,
+				statusText: 'Partial Content',
+				headers,
+			});
+		}
+
+		// Risposta normale o con trasformazioni
+		return new Response(object.body, {
+			headers,
+			cf: hasTransformations ? { image: cfOptions } : undefined,
+		});
+	} catch (error) {
+		console.error(`R2 error (${objectKey}):`, error);
+		return new Response('Storage Error', { status: 500 });
 	}
 }
 
 /**
- * Creates a new Response with additional or overwritten headers.
- * @param response The original response.
- * @param newHeaders An object of headers to add or overwrite.
- * @returns A new Response object with the modified headers.
+ * Serve un'immagine trasformata con fallback
  */
-function createResponseWithHeaders(response: Response, newHeaders: Record<string, string>): Response {
-	const headers = new Headers(response.headers);
-	for (const [key, value] of Object.entries(newHeaders)) {
-		headers.set(key, value);
+async function serveTransformedImage(
+	pathname: string,
+	options: CfImageTransformOptions,
+	env: Env,
+	isHeadRequest = false,
+): Promise<Response> {
+	try {
+		const transformedResponse = await fetchFromR2(pathname, options, env, isHeadRequest);
+
+		if (transformedResponse.ok) {
+			transformedResponse.headers.set('X-Transform-Status', 'success');
+			return transformedResponse;
+		}
+
+		// Fallback all'originale in caso di errore
+		console.warn(`Transformation failed (${pathname}). Falling back to original.`);
+		const fallbackResponse = await fetchFromR2(pathname, {}, env, isHeadRequest);
+		fallbackResponse.headers.set('X-Transform-Status', 'fallback-original');
+		return fallbackResponse;
+	} catch (error) {
+		console.error(`Transform error (${pathname}):`, error);
+		return new Response('Transform Error', { status: 500 });
+	}
+}
+
+// ==== Hono App Setup ====
+
+const app = new Hono<{ Bindings: Env }>();
+
+// ==== Middleware ====
+
+// Compressione automatica per risparmiare banda
+app.use('*', compress());
+
+// Security headers
+app.use(
+	'*',
+	secureHeaders({
+		xContentTypeOptions: 'nosniff',
+		xFrameOptions: 'DENY',
+		xXssProtection: '1; mode=block',
+	}),
+);
+
+// CORS configurato per CDN
+app.use(
+	'*',
+	cors({
+		origin: (origin, c) => c.env.ALLOWED_ORIGINS || '*',
+		allowMethods: ['GET', 'HEAD', 'OPTIONS'],
+		allowHeaders: ['Content-Type', 'Range', 'If-Range', 'If-None-Match'],
+		exposeHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length'],
+		maxAge: 86400,
+		credentials: false,
+	}),
+);
+
+// Logging minimale
+app.use('*', logger());
+
+// Rate limiting configurabile
+app.use('*', async (c, next) => {
+	if (!c.env.RATE_LIMITER) return next();
+
+	const clientIP = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for');
+	if (!clientIP) return next();
+
+	try {
+		const { success } = await c.env.RATE_LIMITER.limit({ key: clientIP });
+		if (!success) return c.text('Rate limit exceeded', 429);
+	} catch (error) {
+		console.error('Rate limit error:', error);
+		// Continua anche se il rate limiter fallisce
 	}
 
-	return new Response(response.body, {
-		status: response.status,
-		statusText: response.statusText,
-		headers,
+	return next();
+});
+
+// Caching ottimizzato
+app.use('/*', async (c, next) => {
+	// Skip cache per health check
+	if (c.req.path === '/health') return next();
+
+	try {
+		const cache = caches.default;
+		const url = new URL(c.req.url);
+
+		// Crea una chiave di cache che include Range e Accept-Encoding
+		const cacheKeyHeaders = new Headers();
+		const range = c.req.header('range');
+		const encoding = c.req.header('accept-encoding');
+
+		if (range) cacheKeyHeaders.set('range', range);
+		if (encoding) cacheKeyHeaders.set('accept-encoding', encoding);
+
+		const cacheKey = new Request(url.toString(), { headers: cacheKeyHeaders });
+		const cachedResponse = await cache.match(cacheKey);
+
+		if (cachedResponse) {
+			const response = new Response(cachedResponse.body, cachedResponse);
+			response.headers.set('X-Cache-Status', 'HIT');
+			return response;
+		}
+
+		await next();
+
+		// Cache solo risposte riuscite
+		if (c.res && c.res.ok) {
+			const response = c.res.clone();
+			response.headers.set('X-Cache-Status', 'MISS');
+
+			// Memorizzazione asincrona nella cache
+			c.executionCtx.waitUntil(cache.put(cacheKey, response.clone()));
+		}
+	} catch (error) {
+		console.error('Cache error:', error);
+		return next();
+	}
+});
+
+// ==== Routes ====
+
+// Diagnostica e Monitoraggio
+app.get('/health', (c) => {
+	const data: HealthResponse = {
+		status: 'ok',
+		timestamp: new Date().toISOString(),
+		worker: 'wolfstar-cdn',
+		region: c.req.header('cf-ray')?.split('-')[1],
+	};
+
+	return c.json(data, 200, {
+		'Cache-Control': 'no-store',
+		'X-Robots-Tag': 'noindex',
 	});
-}
+});
+
+// Route principale per asset
+app.get('/*', async (c) => {
+	try {
+		const { pathname, searchParams } = new URL(c.req.url);
+		const isHeadRequest = c.req.method === 'HEAD';
+		const rangeHeader = c.req.header('range');
+
+		// Determina se è un'immagine
+		const fileExtension = getFileExtension(pathname);
+		const isImage = IMAGE_EXTENSIONS.has(fileExtension);
+
+		if (!isImage) {
+			// File statici (non immagini)
+			return await fetchFromR2(pathname, {}, c.env, isHeadRequest, rangeHeader);
+		}
+
+		// Analizza parametri di trasformazione
+		const transformOptions = parseTransformations(searchParams);
+		const hasTransformations = Object.keys(transformOptions).length > 0;
+
+		if (!hasTransformations) {
+			// Immagini originali
+			return await fetchFromR2(pathname, {}, c.env, isHeadRequest, rangeHeader);
+		}
+
+		// Le trasformazioni immagini non supportano Range requests
+		if (rangeHeader) {
+			return c.text('Range requests not supported for image transformations', 400);
+		}
+
+		// Immagini trasformate
+		return await serveTransformedImage(pathname, transformOptions, c.env, isHeadRequest);
+	} catch (error) {
+		console.error('Request handler error:', error);
+		const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+		return c.text(`CDN Error: ${errorMessage}`, 500);
+	}
+});
+
+export default app;
