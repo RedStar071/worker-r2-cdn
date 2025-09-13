@@ -37,6 +37,12 @@ interface HealthResponse {
 	region?: string;
 }
 
+interface ErrorResponse {
+	error: string;
+	message: string;
+	timestamp: string;
+}
+
 // ==== Costanti ====
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'tiff', 'avif']);
@@ -44,23 +50,51 @@ const ALLOWED_FIT_MODES = new Set<CfImageFit>(['scale-down', 'contain', 'cover',
 const ALLOWED_FORMATS = new Set<CfImageFormat>(['webp', 'avif', 'jpeg', 'png', 'json']);
 const IMMUTABLE_CACHE_TTL = 31536000; // 1 anno (in secondi)
 
+// Limiti per prevenire abusi
+const MAX_IMAGE_DIMENSION = 4096;
+const MIN_IMAGE_DIMENSION = 1;
+const MAX_QUALITY = 100;
+const MIN_QUALITY = 1;
+
 const DEFAULT_TRANSFORM_OPTIONS: Readonly<Partial<CfImageTransformOptions>> = {
 	quality: 85,
 };
 
+const DEFAULT_ALLOWED_ORIGINS = ['https://*.wolfstar.it', 'https://wolfstar.it'];
+
 // ==== Helper Functions ====
 
 /**
- * Type guard per R2ObjectBody
+ * Type guard migliorato per R2ObjectBody
  */
-function isR2ObjectBody(obj: any): obj is R2ObjectBody {
+function isR2ObjectBody(obj: unknown): obj is R2ObjectBody {
 	return (
-		!!obj &&
+		obj !== null &&
 		typeof obj === 'object' &&
 		'body' in obj &&
 		'size' in obj &&
-		'httpEtag' in obj
+		'httpEtag' in obj &&
+		typeof (obj as Record<string, unknown>).size === 'number'
 	);
+}
+
+/**
+ * Crea una risposta di errore standardizzata
+ */
+function createErrorResponse(error: string, message: string, status = 500): Response {
+	const errorResponse: ErrorResponse = {
+		error,
+		message,
+		timestamp: new Date().toISOString(),
+	};
+
+	return new Response(JSON.stringify(errorResponse), {
+		status,
+		headers: {
+			'Content-Type': 'application/json',
+			'Cache-Control': 'no-store',
+		},
+	});
 }
 
 /**
@@ -78,7 +112,21 @@ function normalizeObjectKey(pathname: string): string {
 }
 
 /**
- * Analizza le trasformazioni dalle query params
+ * Valida le dimensioni delle immagini
+ */
+function validateImageDimension(value: number): boolean {
+	return Number.isInteger(value) && value >= MIN_IMAGE_DIMENSION && value <= MAX_IMAGE_DIMENSION;
+}
+
+/**
+ * Valida la qualità dell'immagine
+ */
+function validateImageQuality(value: number): boolean {
+	return Number.isInteger(value) && value >= MIN_QUALITY && value <= MAX_QUALITY;
+}
+
+/**
+ * Analizza le trasformazioni dalle query params con validazione rigorosa
  */
 function parseTransformations(searchParams: URLSearchParams): CfImageTransformOptions {
 	const hasTransformationParams = ['w', 'h', 'q', 'fit', 'f'].some((p) => searchParams.has(p));
@@ -86,34 +134,44 @@ function parseTransformations(searchParams: URLSearchParams): CfImageTransformOp
 
 	const options: CfImageTransformOptions = { ...DEFAULT_TRANSFORM_OPTIONS };
 
-	// Larghezza
+	// Larghezza con validazione
 	const widthParam = searchParams.get('w');
 	if (widthParam) {
 		const width = parseInt(widthParam, 10);
-		if (!isNaN(width) && width > 0) options.width = width;
+		if (validateImageDimension(width)) {
+			options.width = width;
+		}
 	}
 
-	// Altezza
+	// Altezza con validazione
 	const heightParam = searchParams.get('h');
 	if (heightParam) {
 		const height = parseInt(heightParam, 10);
-		if (!isNaN(height) && height > 0) options.height = height;
+		if (validateImageDimension(height)) {
+			options.height = height;
+		}
 	}
 
-	// Qualità
+	// Qualità con validazione
 	const qualityParam = searchParams.get('q');
 	if (qualityParam) {
 		const quality = parseInt(qualityParam, 10);
-		if (!isNaN(quality) && quality > 0 && quality <= 100) options.quality = quality;
+		if (validateImageQuality(quality)) {
+			options.quality = quality;
+		}
 	}
 
 	// Modalità di adattamento
 	const fitParam = searchParams.get('fit') as CfImageFit;
-	if (fitParam && ALLOWED_FIT_MODES.has(fitParam)) options.fit = fitParam;
+	if (fitParam && ALLOWED_FIT_MODES.has(fitParam)) {
+		options.fit = fitParam;
+	}
 
 	// Formato output
 	const formatParam = searchParams.get('f')?.toLowerCase() as CfImageFormat;
-	if (formatParam && ALLOWED_FORMATS.has(formatParam)) options.format = formatParam;
+	if (formatParam && ALLOWED_FORMATS.has(formatParam)) {
+		options.format = formatParam;
+	}
 
 	return options;
 }
@@ -156,7 +214,9 @@ async function fetchFromR2(
 		// Ottimizzazione per HEAD requests
 		if (isHeadRequest) {
 			const headObj = await env.wolfstar_cdn.head(objectKey);
-			if (!headObj) return new Response('Not Found', { status: 404 });
+			if (!headObj) {
+				return new Response('Not Found', { status: 404 });
+			}
 
 			const headers = new Headers();
 			headObj.writeHttpMetadata(headers);
@@ -173,12 +233,13 @@ async function fetchFromR2(
 			range = parseRangeHeader(rangeHeader);
 		}
 
-		// Ottimizzazione: evita di scaricare l'oggetto se l'etag corrisponde
 		const options: R2GetOptions = {};
 		if (range) options.range = range;
 
 		const object = await env.wolfstar_cdn.get(objectKey, options);
-		if (!isR2ObjectBody(object)) return new Response('Not Found', { status: 404 });
+		if (!isR2ObjectBody(object)) {
+			return new Response('Not Found', { status: 404 });
+		}
 
 		const headers = new Headers();
 		object.writeHttpMetadata(headers);
@@ -222,7 +283,7 @@ async function fetchFromR2(
 		});
 	} catch (error) {
 		console.error(`R2 error (${objectKey}):`, error);
-		return new Response('Storage Error', { status: 500 });
+		return createErrorResponse('STORAGE_ERROR', 'Unable to retrieve file from storage', 500);
 	}
 }
 
@@ -246,11 +307,40 @@ async function serveTransformedImage(
 		// Fallback all'originale in caso di errore
 		console.warn(`Transformation failed (${pathname}). Falling back to original.`);
 		const fallbackResponse = await fetchFromR2(pathname, {}, env, isHeadRequest);
-		fallbackResponse.headers.set('X-Transform-Status', 'fallback-original');
+		if (fallbackResponse.ok) {
+			fallbackResponse.headers.set('X-Transform-Status', 'fallback-original');
+			return fallbackResponse;
+		}
+
 		return fallbackResponse;
 	} catch (error) {
 		console.error(`Transform error (${pathname}):`, error);
-		return new Response('Transform Error', { status: 500 });
+		return createErrorResponse('TRANSFORM_ERROR', 'Unable to process image transformation', 500);
+	}
+}
+
+/**
+ * Determina le origini consentite per CORS
+ */
+function getAllowedOrigins(env: Env): string[] {
+	if (env.ALLOWED_ORIGINS) {
+		return env.ALLOWED_ORIGINS.split(',').map((origin) => origin.trim());
+	}
+	return DEFAULT_ALLOWED_ORIGINS;
+}
+
+/**
+ * Gestisce il rate limiting in modo sicuro
+ */
+async function handleRateLimit(clientIP: string, rateLimiter: RateLimit): Promise<boolean> {
+	try {
+		const { success } = await rateLimiter.limit({ key: clientIP });
+		return success;
+	} catch (error) {
+		console.error('Rate limit error:', error);
+		// In caso di errore del rate limiter, permettiamo la richiesta
+		// ma logghiamo l'errore per il monitoraggio
+		return true;
 	}
 }
 
@@ -259,6 +349,12 @@ async function serveTransformedImage(
 const app = new Hono<{ Bindings: Env }>();
 
 // ==== Middleware ====
+
+// Gestione centralizzata degli errori
+app.onError((err, c) => {
+	console.error('Unhandled error:', err);
+	return createErrorResponse('INTERNAL_ERROR', 'An unexpected error occurred', 500);
+});
 
 // Compressione automatica per risparmiare banda
 app.use('*', compress());
@@ -273,11 +369,32 @@ app.use(
 	}),
 );
 
-// CORS configurato per CDN
+// CORS configurato per CDN con gestione migliorata
 app.use(
 	'*',
 	cors({
-		origin: (origin, c) => c.env.ALLOWED_ORIGINS || '',
+		origin: (origin, c) => {
+			const allowedOrigins = getAllowedOrigins(c.env);
+
+			if (!origin) {
+				// Consenti richieste senza origine (es. richieste dirette, Postman)
+				// In questo caso, non c'è un'intestazione Origin da restituire.
+				// Restituire null o undefined è un modo per gestire questo caso,
+				// ma per essere espliciti, possiamo restituire l'origine stessa (che è falsy).
+				return origin;
+			}
+
+			const isAllowed = allowedOrigins.some((allowed) => {
+				if (allowed.includes('*')) {
+					const pattern = allowed.replace(/\*/g, '.*');
+					const regex = new RegExp(`^${pattern}$`);
+					return regex.test(origin);
+				}
+				return allowed === origin;
+			});
+
+			return isAllowed ? origin : null;
+		},
 		allowMethods: ['GET', 'HEAD', 'OPTIONS'],
 		allowHeaders: ['Content-Type', 'Range', 'If-Range', 'If-None-Match'],
 		exposeHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length'],
@@ -289,25 +406,26 @@ app.use(
 // Logging minimale
 app.use('*', logger());
 
-// Rate limiting configurabile
+// Rate limiting con gestione migliorata degli errori
 app.use('*', async (c, next) => {
 	if (!c.env.RATE_LIMITER) return next();
 
-	const clientIP = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for');
-	if (!clientIP) return next();
+	const clientIP = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip');
 
-	try {
-		const { success } = await c.env.RATE_LIMITER.limit({ key: clientIP });
-		if (!success) return c.text('Rate limit exceeded', 429);
-	} catch (error) {
-		console.error('Rate limit error:', error);
-		// Continua anche se il rate limiter fallisce
+	if (!clientIP) {
+		console.warn('Unable to determine client IP for rate limiting');
+		return next();
+	}
+
+	const isAllowed = await handleRateLimit(clientIP, c.env.RATE_LIMITER);
+	if (!isAllowed) {
+		return createErrorResponse('RATE_LIMITED', 'Too many requests', 429);
 	}
 
 	return next();
 });
 
-// Caching ottimizzato
+// Caching ottimizzato con gestione degli errori
 app.use('/*', async (c, next) => {
 	// Skip cache per health check
 	if (c.req.path === '/health') return next();
@@ -340,12 +458,23 @@ app.use('/*', async (c, next) => {
 			const response = c.res.clone();
 			response.headers.set('X-Cache-Status', 'MISS');
 
-			// Memorizzazione asincrona nella cache
-			c.executionCtx?.waitUntil(cache.put(cacheKey, response.clone()));
+			// Memorizzazione sicura nella cache
+			if (c.executionCtx) {
+				c.executionCtx.waitUntil(
+					cache.put(cacheKey, response.clone()).catch((error) => {
+						console.error('Cache storage error:', error);
+					}),
+				);
+			} else {
+				// Fallback per memorizzazione sincrona se il contesto non è disponibile
+				cache.put(cacheKey, response.clone()).catch((error) => {
+					console.error('Cache storage error:', error);
+				});
+			}
 		}
 	} catch (error) {
-		console.error('Cache error:', error);
-		return next();
+		console.error('Cache middleware error:', error);
+		await next();
 	}
 });
 
@@ -393,16 +522,21 @@ app.get('/*', async (c) => {
 
 		// Le trasformazioni immagini non supportano Range requests
 		if (rangeHeader) {
-			return c.text('Range requests not supported for image transformations', 400);
+			return createErrorResponse('RANGE_NOT_SUPPORTED', 'Range requests are not supported for image transformations', 400);
 		}
 
 		// Immagini trasformate
 		return await serveTransformedImage(pathname, transformOptions, c.env, isHeadRequest);
 	} catch (error) {
 		console.error('Request handler error:', error);
-		const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-		return c.text(`CDN Error: ${errorMessage}`, 500);
+		const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+		return createErrorResponse('REQUEST_ERROR', errorMessage, 500);
 	}
+});
+
+// Gestione 404 per percorsi non trovati
+app.notFound((c) => {
+	return createErrorResponse('NOT_FOUND', 'The requested resource was not found', 404);
 });
 
 export default app;
