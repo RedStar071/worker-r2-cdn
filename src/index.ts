@@ -341,7 +341,7 @@ app.use('/*', async (c, next) => {
 			response.headers.set('X-Cache-Status', 'MISS');
 
 			// Memorizzazione asincrona nella cache
-			c.executionCtx.waitUntil(cache.put(cacheKey, response.clone()));
+			c.executionCtx?.waitUntil(cache.put(cacheKey, response.clone()));
 		}
 	} catch (error) {
 		console.error('Cache error:', error);
