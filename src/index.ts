@@ -60,8 +60,6 @@ const DEFAULT_TRANSFORM_OPTIONS: Readonly<Partial<CfImageTransformOptions>> = {
 	quality: 85,
 };
 
-const DEFAULT_ALLOWED_ORIGINS = ['https://*.wolfstar.it', 'https://wolfstar.it'];
-
 // ==== Helper Functions ====
 
 /**
@@ -326,7 +324,7 @@ function getAllowedOrigins(env: Env): string[] {
 	if (env.ALLOWED_ORIGINS) {
 		return env.ALLOWED_ORIGINS.split(',').map((origin) => origin.trim());
 	}
-	return DEFAULT_ALLOWED_ORIGINS;
+	return [];
 }
 
 /**
