@@ -142,6 +142,15 @@ export function parseTransformations(pathname: string, searchParams: URLSearchPa
 	const formatParam = searchParams.get('f')?.toLowerCase() as CfImageFormat;
 	if (formatParam && ALLOWED_FORMATS.has(formatParam)) {
 		options.format = formatParam;
+	} else if (formatParam) {
+		// If an unsupported format is specifically requested, we return null to avoid transformation
+		// This prevents unsupported formats like 'json' from being passed to Cloudflare's image service
+		const hasOtherValidParams = ['w', 'h', 'q', 'fit'].some((p) => searchParams.has(p));
+		if (!hasOtherValidParams) {
+			// Only unsupported format requested, skip transformation entirely
+			return null;
+		}
+		// Otherwise, proceed with transformation but ignore the invalid format
 	}
 
 	return options;
