@@ -271,7 +271,7 @@ app.use(
 app.use(
 	'*',
 	cors({
-		origin: (origin, c) => c.env.ALLOWED_ORIGINS || '*',
+		origin: (origin, c) => c.env.ALLOWED_ORIGINS || '',
 		allowMethods: ['GET', 'HEAD', 'OPTIONS'],
 		allowHeaders: ['Content-Type', 'Range', 'If-Range', 'If-None-Match'],
 		exposeHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length'],
