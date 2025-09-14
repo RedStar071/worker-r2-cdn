@@ -263,7 +263,7 @@ export async function fetchFromR2(
 
 			headers.set('content-range', `bytes ${start}-${end}/${object.size}`);
 
-			return c.json(object.body, {
+			return new Response(object.body, {
 				status: 206, // Partial Content
 				statusText: 'Partial Content',
 				headers,
@@ -271,7 +271,7 @@ export async function fetchFromR2(
 		}
 
 		// Return a normal response or a response with image transformations
-		return c.json(
+		return new Response(
 			object.body,
 			cfOptions !== null
 				? {
