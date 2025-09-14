@@ -39,7 +39,7 @@
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
 	 */
 	"vars": {
-		"ALLOWED_ORIGINS": "https://www.wolfstar.rocks,https://wolfstar.rocks",
+		"ALLOWED_ORIGINS": "https://wolfstar.rocks",
 		"R2_WORKER_URL": "worker-r2-cdn.redstar071.workers.dev"
 	},
 	/**
