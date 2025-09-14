@@ -40,10 +40,22 @@ app.onError((err) => {
 app.use('*', compress());
 
 /**
- * Adds ETag headers to all responses for efficient client-side caching.
- * The client can use the ETag to conditionally request content.
+ * Adds ETag headers to non-image transformation responses for efficient client-side caching.
+ * For image transformations, we let Cloudflare handle ETag generation to avoid conflicts.
  */
-app.use('/*', etag());
+app.use('/*', async (c, next) => {
+	// Check if this is an image transformation request
+	const url = new URL(c.req.url);
+	const hasTransformParams = ['w', 'h', 'q', 'fit', 'f'].some((param) => url.searchParams.has(param));
+
+	if (hasTransformParams) {
+		// Skip ETag middleware for image transformations to avoid conflicts with Cloudflare's ETag handling
+		await next();
+	} else {
+		// Apply ETag middleware for non-transformed content
+		await etag()(c, next);
+	}
+});
 
 /**
  * Applies a set of important security headers to all responses.

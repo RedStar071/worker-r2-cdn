@@ -2,7 +2,7 @@
 
 // Types for image transformation
 type CfImageFit = 'scale-down' | 'contain' | 'cover' | 'crop' | 'pad';
-type CfImageFormat = 'webp' | 'avif' | 'jpeg' | 'png' | 'json';
+type CfImageFormat = 'webp' | 'avif' | 'jpeg' | 'png';
 
 interface CfImageTransformOptions {
 	width?: number;
