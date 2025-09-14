@@ -23,6 +23,7 @@
 		"*": ["biome format --no-errors-on-unmatched --files-ignore-unknown=true"]
 	},
 	"dependencies": {
+		"@hono-rate-limiter/cloudflare": "^0.2.2",
 		"hono": "^4.9.7"
 	}
 }

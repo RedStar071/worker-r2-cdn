@@ -11,6 +11,7 @@ import {
 	MIN_QUALITY,
 } from './constants';
 import type { CfImageFit, CfImageFormat, CfImageTransformOptions, CloudflareEnv, ErrorResponse } from './types';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
 /**
  * An improved type guard to check if an object is an R2ObjectBody.
@@ -35,19 +36,21 @@ export function isR2ObjectBody(obj: unknown): obj is R2ObjectBody {
  * @param status - The HTTP status code for the response.
  * @returns A Response object containing the JSON error payload.
  */
-export function createErrorResponse(error: string, message: string, status = 500): Response {
+export function createErrorResponse(
+	c: Context<CloudflareEnv>,
+	error: string,
+	message: string,
+	status: ContentfulStatusCode = 500,
+): Response {
 	const errorResponse: ErrorResponse = {
 		error,
 		message,
 		timestamp: new Date().toISOString(),
 	};
 
-	return new Response(JSON.stringify(errorResponse), {
-		status,
-		headers: {
-			'Content-Type': 'application/json',
-			'Cache-Control': 'no-store', // Ensure error responses are not cached
-		},
+	return c.json(errorResponse, status, {
+		'Content-Type': 'application/json',
+		'Cache-Control': 'no-store', // Ensure error responses are not cached
 	});
 }
 
@@ -204,7 +207,7 @@ export async function fetchFromR2(
 		if (isHeadRequest) {
 			const headObj = await c.env.wolfstar_cdn.head(objectKey);
 			if (!headObj) {
-				return createErrorResponse('NOT_FOUND', 'Object not found in R2', 404);
+				return createErrorResponse(c, 'NOT_FOUND', 'Object not found in R2', 404);
 			}
 
 			const headers = new Headers();
@@ -228,7 +231,7 @@ export async function fetchFromR2(
 		// Fetch the object from R2
 		const object = await c.env.wolfstar_cdn.get(objectKey, options);
 		if (!isR2ObjectBody(object)) {
-			return createErrorResponse('INCOMPLETE_OBJECT', 'Object not correct or incomplete', 404);
+			return createErrorResponse(c, 'INCOMPLETE_OBJECT', 'Object not correct or incomplete', 404);
 		}
 
 		const headers = new Headers();
@@ -260,7 +263,7 @@ export async function fetchFromR2(
 
 			headers.set('content-range', `bytes ${start}-${end}/${object.size}`);
 
-			return new Response(object.body, {
+			return c.json(object.body, {
 				status: 206, // Partial Content
 				statusText: 'Partial Content',
 				headers,
@@ -268,7 +271,7 @@ export async function fetchFromR2(
 		}
 
 		// Return a normal response or a response with image transformations
-		return new Response(
+		return c.json(
 			object.body,
 			cfOptions !== null
 				? {
@@ -281,7 +284,7 @@ export async function fetchFromR2(
 		);
 	} catch (error) {
 		console.error(`R2 error for object '${objectKey}':`, error);
-		return createErrorResponse('STORAGE_ERROR', 'Unable to retrieve file from storage', 500);
+		return createErrorResponse(c, 'STORAGE_ERROR', 'Unable to retrieve file from storage', 500);
 	}
 }
 
@@ -296,22 +299,4 @@ export function getAllowedOrigins(_origin: string, c: Context<CloudflareEnv>): s
 		return c.env.ALLOWED_ORIGINS;
 	}
 	return null;
-}
-
-/**
- * Safely handles rate limiting for a given client IP.
- * @param clientIP - The IP address of the client.
- * @param rateLimiter - The Cloudflare Rate Limiter binding.
- * @returns True if the request is allowed, false otherwise.
- */
-export async function handleRateLimit(clientIP: string, rateLimiter: RateLimit): Promise<boolean> {
-	try {
-		const { success } = await rateLimiter.limit({ key: clientIP });
-		return success;
-	} catch (error) {
-		console.error('Rate limiter error:', error);
-		// In case of a rate limiter error, allow the request to proceed
-		// but log the error for monitoring purposes.
-		return true;
-	}
 }

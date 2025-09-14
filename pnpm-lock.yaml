@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@hono-rate-limiter/cloudflare':
+        specifier: ^0.2.2
+        version: 0.2.2(@cloudflare/workers-types@4.20250913.0)(hono@4.9.7)
       hono:
         specifier: ^4.9.7
         version: 4.9.7
@@ -285,6 +288,12 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@hono-rate-limiter/cloudflare@0.2.2':
+    resolution: {integrity: sha512-wMnqeV+cb5Wov2npLIMFtCVm3tiNMtqw9LhPWSzSMwHOzh2qbhI3mCS6s962fxcJ6UUNJhRqDbVMEsB/NinCIQ==}
+    peerDependencies:
+      '@cloudflare/workers-types': ^4.20240529.0
+      hono: ^4.4.8
 
   '@img/sharp-darwin-arm64@0.33.5':
     resolution: {integrity: sha512-UT4p+iz/2H4twwAoLCqfA9UH5pI6DggwKEGuaPy7nCVQ8ZsiY5PIcrRvD1DzuY3qYL07NtIQcWnBSY/heikIFQ==}
@@ -733,6 +742,11 @@ snapshots:
 
   '@esbuild/win32-x64@0.25.4':
     optional: true
+
+  '@hono-rate-limiter/cloudflare@0.2.2(@cloudflare/workers-types@4.20250913.0)(hono@4.9.7)':
+    dependencies:
+      '@cloudflare/workers-types': 4.20250913.0
+      hono: 4.9.7
 
   '@img/sharp-darwin-arm64@0.33.5':
     optionalDependencies:

@@ -2,13 +2,12 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { secureHeaders } from 'hono/secure-headers';
-import { compress } from 'hono/compress';
-import { etag } from 'hono/etag';
-import { createErrorResponse, fetchFromR2, getAllowedOrigins as origin, handleRateLimit, parseTransformations } from './utils';
+import { createErrorResponse, fetchFromR2, getAllowedOrigins as origin, parseTransformations } from './utils';
 import type { CloudflareEnv, HealthResponse } from './types';
+import { cloudflareRateLimiter } from '@hono-rate-limiter/cloudflare';
 
 /**
- * Wolfstar CDN - Image Delivery & Transformation Service
+ * Worker R2 CDN - Image Delivery & Transformation Service
  * Optimized for Cloudflare Workers and R2 Storage.
  * This worker handles fetching images from R2, applying transformations,
  * and serving them with appropriate caching and security headers.
@@ -28,33 +27,9 @@ const app = new Hono<CloudflareEnv>();
  * Centralized error handling for the application.
  * Catches any unhandled errors, logs them, and returns a standardized JSON error response.
  */
-app.onError((err) => {
+app.onError((err, c) => {
 	console.error('Unhandled error:', err);
-	return createErrorResponse('INTERNAL_ERROR', 'An unexpected error occurred', 500);
-});
-
-/**
- * Enables automatic response compression (Gzip/Brotli) for all routes.
- * This reduces bandwidth usage and improves loading times.
- */
-app.use('*', compress());
-
-/**
- * Adds ETag headers to non-image transformation responses for efficient client-side caching.
- * For image transformations, we let Cloudflare handle ETag generation to avoid conflicts.
- */
-app.use('/*', async (c, next) => {
-	// Check if this is an image transformation request
-	const url = new URL(c.req.url);
-	const hasTransformParams = ['w', 'h', 'q', 'fit', 'f'].some((param) => url.searchParams.has(param));
-
-	if (hasTransformParams) {
-		// Skip ETag middleware for image transformations to avoid conflicts with Cloudflare's ETag handling
-		await next();
-	} else {
-		// Apply ETag middleware for non-transformed content
-		await etag()(c, next);
-	}
+	return createErrorResponse(c, 'INTERNAL_ERROR', 'An unexpected error occurred', 500);
 });
 
 /**
@@ -96,26 +71,13 @@ app.use('*', logger());
  * Implements rate limiting to protect the service from abuse.
  * It uses the client's IP address and a Cloudflare Rate Limiter binding.
  */
-app.use('*', async (c, next) => {
-	// Skip if the rate limiter is not configured
-	if (!c.env.RATE_LIMITER) return next();
-
-	// Determine the client's IP address from headers
-	const clientIP = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip');
-
-	if (!clientIP) {
-		console.warn('Unable to determine client IP for rate limiting');
-		return next();
-	}
-
-	// Check if the request is allowed by the rate limiter
-	const isAllowed = await handleRateLimit(clientIP, c.env.RATE_LIMITER);
-	if (!isAllowed) {
-		return createErrorResponse('RATE_LIMITED', 'Too many requests', 429);
-	}
-
-	await next();
-});
+app.use(
+	'*',
+	cloudflareRateLimiter<CloudflareEnv>({
+		rateLimitBinding: (c) => c.env.RATE_LIMITER,
+		keyGenerator: (c) => (c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip')) ?? '', // Method to generate custom identifiers for clients.
+	}),
+);
 
 /**
  * Implements a cache-aside strategy using the Cloudflare Cache API.
@@ -194,7 +156,7 @@ app.get('/*', async (c) => {
 
 		// Image transformations do not support Range requests.
 		if (rangeHeader) {
-			return createErrorResponse('RANGE_NOT_SUPPORTED', 'Range requests are not supported for image transformations', 400);
+			return createErrorResponse(c, 'RANGE_NOT_SUPPORTED', 'Range requests are not supported for image transformations', 400);
 		}
 
 		// Serve the transformed image
@@ -202,7 +164,7 @@ app.get('/*', async (c) => {
 	} catch (error) {
 		console.error('Request handler error:', error);
 		const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-		return createErrorResponse('REQUEST_ERROR', errorMessage, 500);
+		return createErrorResponse(c, 'REQUEST_ERROR', errorMessage, 500);
 	}
 });
 
@@ -233,8 +195,8 @@ app.get('/health', (c) => {
  * Handles all requests that do not match any other route.
  * Returns a standardized 404 Not Found error response.
  */
-app.notFound(() => {
-	return createErrorResponse('NOT_FOUND', 'The requested resource was not found', 404);
+app.notFound((c) => {
+	return createErrorResponse(c, 'NOT_FOUND', 'The requested resource was not found', 404);
 });
 
 /**
