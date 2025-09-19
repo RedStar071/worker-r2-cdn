@@ -21,19 +21,6 @@
 	 * databases, object storage, AI inference, real-time communication and more.
 	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
 	 */
-	"unsafe": {
-		"bindings": [
-			{
-				"name": "RATE_LIMITER",
-				"type": "ratelimit",
-				"namespace_id": "1", // Replace with your Production Rate Limiting Namespace ID
-				"simple": {
-					"limit": 20,
-					"period": 60
-				}
-			}
-		]
-	},
 	/**
 	 * Environment Variables
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
@@ -51,6 +38,21 @@
 	 * https://developers.cloudflare.com/workers/static-assets/binding/
 	 */
 	// "assets": { "directory": "./public/", "binding": "ASSETS" }
+
+	/**
+	 * Rate Limiting
+	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+	 */
+	"ratelimits": [
+		{
+			"name": "RATE_LIMITER",
+			"namespace_id": "1002", // Replace with your Production Rate Limiting Namespace ID
+			"simple": {
+				"limit": 20,
+				"period": 60
+			}
+		}
+	],
 	/**
 	 * Service Bindings (communicate between multiple Workers)
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
