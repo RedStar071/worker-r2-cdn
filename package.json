@@ -11,11 +11,11 @@
 		"prepare": "husky"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "2.3.2",
-		"@cloudflare/workers-types": "^4.20251014.0",
+		"@biomejs/biome": "2.3.4",
+		"@cloudflare/workers-types": "^4.20251109.0",
 		"husky": "^9.1.7",
 		"typescript": "^5.9.2",
-		"wrangler": "^4.45.3"
+		"wrangler": "^4.46.0"
 	},
 	"packageManager": "pnpm@10.20.0",
 	"lint-staged": {
