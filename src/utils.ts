@@ -290,13 +290,24 @@ export async function fetchFromR2(
 
 /**
  * Determines the allowed origins for CORS based on environment variables.
+ * Checks if the requesting origin is in the allowed list and returns only that origin.
+ * This is required because Access-Control-Allow-Origin can only contain a single origin value.
+ * @param origin - The requesting origin from the Origin header.
  * @param c - The Hono context.
- * @returns An array of allowed origin strings.
+ * @returns The matching origin string if allowed, or null if not allowed.
  */
-export function getAllowedOrigins(_origin: string, c: Context<CloudflareEnv>): string | null {
-	if (c.env.ALLOWED_ORIGINS) {
-		// Split the comma-separated string and trim whitespace
-		return c.env.ALLOWED_ORIGINS;
+export function getAllowedOrigins(origin: string, c: Context<CloudflareEnv>): string | null {
+	if (!c.env.ALLOWED_ORIGINS) {
+		return null;
 	}
+
+	// Split the comma-separated string and trim whitespace
+	const allowedOrigins = c.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim());
+
+	// Check if the requesting origin is in the allowed list
+	if (allowedOrigins.includes(origin)) {
+		return origin;
+	}
+
 	return null;
 }
